@@ -209,6 +209,9 @@ class DownloadSession:
         cookies_path = _get_writable_cookies_path()
         if cookies_path:
             opts["cookiefile"] = str(cookies_path)
+        # Add proxy if configured (for server IP reputation issues)
+        if settings.proxy:
+            opts["proxy"] = settings.proxy
         return opts
 
     def _get_ydl_opts(self) -> dict:
@@ -245,6 +248,10 @@ class DownloadSession:
         cookies_path = _get_writable_cookies_path()
         if cookies_path:
             opts["cookiefile"] = str(cookies_path)
+        
+        # Add proxy if configured (for server IP reputation issues)
+        if settings.proxy:
+            opts["proxy"] = settings.proxy
         
         # Add file size limit if configured
         if self.max_filesize:

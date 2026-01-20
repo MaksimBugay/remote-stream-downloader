@@ -40,6 +40,10 @@ class Settings(BaseSettings):
     # Cookie file for YouTube authentication (to bypass bot detection)
     # Export cookies from browser using: yt-dlp --cookies-from-browser chrome --cookies cookies.txt
     cookies_file: Path | None = None
+    
+    # Proxy for yt-dlp (to bypass IP-based bot detection on servers)
+    # Format: http://user:pass@host:port or socks5://host:port
+    proxy: str | None = None
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
