@@ -36,6 +36,10 @@ class Settings(BaseSettings):
     
     # File size limits
     max_file_size_bytes: int = 1024 * 1024 * 1024  # 1GB default limit
+    
+    # Cookie file for YouTube authentication (to bypass bot detection)
+    # Export cookies from browser using: yt-dlp --cookies-from-browser chrome --cookies cookies.txt
+    cookies_file: Path | None = None
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)

@@ -157,13 +157,17 @@ class DownloadSession:
 
     def _get_extract_opts(self) -> dict:
         """Build yt-dlp options for metadata extraction only."""
-        return {
+        opts = {
             "quiet": True,
             "no_warnings": True,
             "extract_flat": False,
             "noplaylist": self.noplaylist,
             "skip_download": True,
         }
+        # Add cookies if configured (required for YouTube bot detection bypass)
+        if settings.cookies_file and settings.cookies_file.exists():
+            opts["cookiefile"] = str(settings.cookies_file)
+        return opts
 
     def _get_ydl_opts(self) -> dict:
         """Build yt-dlp options dictionary for download."""
@@ -194,6 +198,10 @@ class DownloadSession:
             # No postprocessors - merge_output_format handles container format
             # during download, enabling true streaming-while-downloading
         }
+        
+        # Add cookies if configured (required for YouTube bot detection bypass)
+        if settings.cookies_file and settings.cookies_file.exists():
+            opts["cookiefile"] = str(settings.cookies_file)
         
         # Add file size limit if configured
         if self.max_filesize:
