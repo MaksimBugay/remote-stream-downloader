@@ -50,6 +50,16 @@ async def lifespan(app: FastAPI):
     # Startup: initialize concurrency limiter and temp directory
     _download_semaphore = asyncio.Semaphore(settings.max_concurrent_downloads)
     settings.temp_download_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Log cookies file status
+    if settings.cookies_file:
+        if settings.cookies_file.exists():
+            logger.info(f"Cookies file configured and found: {settings.cookies_file}")
+        else:
+            logger.warning(f"Cookies file configured but NOT found: {settings.cookies_file}")
+    else:
+        logger.info("No cookies file configured (COOKIES_FILE env var not set)")
+    
     logger.info(
         f"yt-dlp service started. Temp dir: {settings.temp_download_dir}, "
         f"max concurrent: {settings.max_concurrent_downloads}"

@@ -1,6 +1,7 @@
 """yt-dlp download service with isolation and timeout support."""
 
 import asyncio
+import logging
 import re
 import shutil
 import unicodedata
@@ -13,6 +14,46 @@ from typing import AsyncIterator, Optional
 import yt_dlp
 
 from app.config import settings
+
+logger = logging.getLogger(__name__)
+
+# Writable copy of cookies file (yt-dlp needs write access to update cookies)
+_cookies_temp_path: Path | None = None
+
+
+def _get_writable_cookies_path() -> Path | None:
+    """
+    Get a writable copy of the cookies file.
+    
+    yt-dlp needs write access to update session cookies from YouTube.
+    This copies the original cookies file to a writable temp location.
+    """
+    global _cookies_temp_path
+    
+    if not settings.cookies_file:
+        logger.debug("No cookies file configured")
+        return None
+    
+    if not settings.cookies_file.exists():
+        logger.warning(f"Cookies file not found: {settings.cookies_file}")
+        return None
+    
+    # Return cached path if already copied and still exists
+    if _cookies_temp_path and _cookies_temp_path.exists():
+        return _cookies_temp_path
+    
+    # Ensure temp directory exists
+    settings.temp_download_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Copy to writable temp directory
+    _cookies_temp_path = settings.temp_download_dir / "cookies.txt"
+    try:
+        shutil.copy2(settings.cookies_file, _cookies_temp_path)
+        logger.info(f"Copied cookies to writable location: {_cookies_temp_path}")
+        return _cookies_temp_path
+    except Exception as e:
+        logger.error(f"Failed to copy cookies file: {e}")
+        return None
 
 
 class DownloadError(Exception):
@@ -165,8 +206,9 @@ class DownloadSession:
             "skip_download": True,
         }
         # Add cookies if configured (required for YouTube bot detection bypass)
-        if settings.cookies_file and settings.cookies_file.exists():
-            opts["cookiefile"] = str(settings.cookies_file)
+        cookies_path = _get_writable_cookies_path()
+        if cookies_path:
+            opts["cookiefile"] = str(cookies_path)
         return opts
 
     def _get_ydl_opts(self) -> dict:
@@ -200,8 +242,9 @@ class DownloadSession:
         }
         
         # Add cookies if configured (required for YouTube bot detection bypass)
-        if settings.cookies_file and settings.cookies_file.exists():
-            opts["cookiefile"] = str(settings.cookies_file)
+        cookies_path = _get_writable_cookies_path()
+        if cookies_path:
+            opts["cookiefile"] = str(cookies_path)
         
         # Add file size limit if configured
         if self.max_filesize:
