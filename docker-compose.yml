@@ -1,0 +1,86 @@
+# yt-dlp Streaming Service - Docker Compose Configuration
+# Usage: docker compose up -d
+
+services:
+  yt-dlp-service:
+    image: yt-dlp-streamer:latest
+    container_name: yt-dlp-streamer
+    restart: unless-stopped
+
+    # Port mapping
+    ports:
+      - "${HOST_PORT:-8000}:8000"
+
+    # Environment configuration
+    environment:
+      # Server settings
+      - HOST=0.0.0.0
+      - PORT=8000
+
+      # Download settings
+      - METADATA_TIMEOUT_SECONDS=${METADATA_TIMEOUT_SECONDS:-300}
+      - DOWNLOAD_TIMEOUT_SECONDS=${DOWNLOAD_TIMEOUT_SECONDS:-1800}
+      - DEFAULT_QUALITY=${DEFAULT_QUALITY:-high}
+      - DEFAULT_CONCURRENT_FRAGMENTS=${DEFAULT_CONCURRENT_FRAGMENTS:-5}
+      - DEFAULT_MERGE_FORMAT=${DEFAULT_MERGE_FORMAT:-mp4}
+
+      # Streaming settings
+      - STREAM_CHUNK_SIZE=${STREAM_CHUNK_SIZE:-1048576}
+
+      # Storage settings
+      - TEMP_DOWNLOAD_DIR=/tmp/yt-dlp-downloads
+      - CLEANUP_ON_ERROR=true
+
+      # Concurrency settings
+      - MAX_CONCURRENT_DOWNLOADS=${MAX_CONCURRENT_DOWNLOADS:-10}
+
+      # File size limits (1GB default)
+      - MAX_FILE_SIZE_BYTES=${MAX_FILE_SIZE_BYTES:-1073741824}
+
+    # Volume for temporary downloads
+    volumes:
+      - yt-dlp-temp:/tmp/yt-dlp-downloads
+
+    # Resource limits
+    deploy:
+      resources:
+        limits:
+          cpus: "${CPU_LIMIT:-2.0}"
+          memory: ${MEMORY_LIMIT:-2G}
+        reservations:
+          cpus: "0.5"
+          memory: 512M
+
+    # Security settings
+    security_opt:
+      - no-new-privileges:true
+    read_only: false
+
+    # Logging configuration
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+    # Health check (overrides Dockerfile healthcheck)
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+    # Network configuration
+    networks:
+      - yt-dlp-network
+
+# Named volumes
+volumes:
+  yt-dlp-temp:
+    driver: local
+
+# Networks
+networks:
+  yt-dlp-network:
+    driver: bridge
