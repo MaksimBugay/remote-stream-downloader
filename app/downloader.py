@@ -260,13 +260,33 @@ class DownloadSession:
         return opts
 
     def _get_format_selector(self) -> str:
-        """Map quality setting to yt-dlp format selector."""
+        """Map quality setting to yt-dlp format selector with flexible fallbacks."""
+        # Format selection strategy:
+        # 1. Try preferred mp4/m4a combination (most compatible)
+        # 2. Fall back to any video+audio (yt-dlp will merge)
+        # 3. Final fallback to best single format
         quality_map = {
-            "best": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
-            "high": "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[height<=1080]/best",
-            "medium": "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720]/best",
-            "low": "bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/best[height<=480]/best",
-            "audio": "bestaudio[ext=m4a]/bestaudio",
+            "best": (
+                "bestvideo[ext=mp4]+bestaudio[ext=m4a]/"
+                "bestvideo+bestaudio/"
+                "best[ext=mp4]/best"
+            ),
+            "high": (
+                "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/"
+                "bestvideo[height<=1080]+bestaudio/"
+                "best[height<=1080][ext=mp4]/best[height<=1080]/best"
+            ),
+            "medium": (
+                "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/"
+                "bestvideo[height<=720]+bestaudio/"
+                "best[height<=720][ext=mp4]/best[height<=720]/best"
+            ),
+            "low": (
+                "bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/"
+                "bestvideo[height<=480]+bestaudio/"
+                "best[height<=480][ext=mp4]/best[height<=480]/best"
+            ),
+            "audio": "bestaudio[ext=m4a]/bestaudio/best",
         }
         return quality_map.get(self.quality, quality_map["best"])
 
