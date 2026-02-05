@@ -17,42 +17,115 @@ from app.config import settings
 
 logger = logging.getLogger(__name__)
 
-# Writable copy of cookies file (yt-dlp needs write access to update cookies)
+# Writable copy of cookies files (yt-dlp needs write access to update cookies)
 _cookies_temp_path: Path | None = None
+_cookies_source_mtime: float | None = None
+_cookies_vk_temp_path: Path | None = None
+_cookies_vk_source_mtime: float | None = None
+
+# VK domain patterns
+VK_DOMAINS = ("vk.com", "vkvideo.ru", "vk.ru", "vk-video.ru")
 
 
-def _get_writable_cookies_path() -> Path | None:
+def _is_vk_url(url: str) -> bool:
+    """Check if URL is a VK/VKVideo URL."""
+    url_lower = url.lower()
+    return any(domain in url_lower for domain in VK_DOMAINS)
+
+
+def _get_writable_cookies_path(url: str | None = None) -> Path | None:
     """
     Get a writable copy of the cookies file.
     
-    yt-dlp needs write access to update session cookies from YouTube.
+    yt-dlp needs write access to update session cookies.
     This copies the original cookies file to a writable temp location.
+    Automatically refreshes if the source file is modified.
+    
+    Args:
+        url: The video URL. If it's a VK URL and cookies_file_vk is configured,
+             the VK-specific cookies will be used.
     """
-    global _cookies_temp_path
+    global _cookies_temp_path, _cookies_source_mtime
+    global _cookies_vk_temp_path, _cookies_vk_source_mtime
     
-    if not settings.cookies_file:
-        logger.debug("No cookies file configured")
+    # Determine which cookies file to use based on URL
+    use_vk_cookies = url and _is_vk_url(url) and settings.cookies_file_vk
+    
+    if use_vk_cookies:
+        source_file = settings.cookies_file_vk
+        temp_path_ref = "_cookies_vk_temp_path"
+        mtime_ref = "_cookies_vk_source_mtime"
+        temp_filename = "cookies-vk.txt"
+        cookie_type = "VK"
+    else:
+        source_file = settings.cookies_file
+        temp_path_ref = "_cookies_temp_path"
+        mtime_ref = "_cookies_source_mtime"
+        temp_filename = "cookies.txt"
+        cookie_type = "general"
+    
+    if not source_file:
+        logger.debug(f"No {cookie_type} cookies file configured")
         return None
     
-    if not settings.cookies_file.exists():
-        logger.warning(f"Cookies file not found: {settings.cookies_file}")
+    logger.debug(f"Checking {cookie_type} cookies file: {source_file}")
+    
+    if not source_file.exists():
+        logger.warning(f"{cookie_type} cookies file not found: {source_file}")
+        # Fall back to general cookies if VK cookies not found
+        if use_vk_cookies and settings.cookies_file and settings.cookies_file.exists():
+            logger.info("Falling back to general cookies file for VK URL")
+            return _get_writable_cookies_path(None)  # Recursively get general cookies
         return None
     
-    # Return cached path if already copied and still exists
-    if _cookies_temp_path and _cookies_temp_path.exists():
-        return _cookies_temp_path
+    # Get source file info
+    source_stat = source_file.stat()
+    cookie_size = source_stat.st_size
+    source_mtime = source_stat.st_mtime
+    
+    logger.debug(f"{cookie_type} cookies file exists, size: {cookie_size} bytes, mtime: {source_mtime}")
+    
+    # Get current cached values
+    if use_vk_cookies:
+        cached_temp_path = _cookies_vk_temp_path
+        cached_mtime = _cookies_vk_source_mtime
+    else:
+        cached_temp_path = _cookies_temp_path
+        cached_mtime = _cookies_source_mtime
+    
+    # Check if we need to refresh the cached copy
+    needs_refresh = False
+    if cached_temp_path and cached_temp_path.exists():
+        # Refresh if source file was modified
+        if cached_mtime is not None and source_mtime > cached_mtime:
+            logger.info(f"Source {cookie_type} cookies file was modified, refreshing cached copy")
+            needs_refresh = True
+        else:
+            logger.debug(f"Using cached {cookie_type} cookies at: {cached_temp_path}")
+            return cached_temp_path
+    else:
+        needs_refresh = True
+    
+    if not needs_refresh:
+        return cached_temp_path
     
     # Ensure temp directory exists
     settings.temp_download_dir.mkdir(parents=True, exist_ok=True)
     
     # Copy to writable temp directory
-    _cookies_temp_path = settings.temp_download_dir / "cookies.txt"
+    new_temp_path = settings.temp_download_dir / temp_filename
     try:
-        shutil.copy2(settings.cookies_file, _cookies_temp_path)
-        logger.info(f"Copied cookies to writable location: {_cookies_temp_path}")
-        return _cookies_temp_path
+        shutil.copy2(source_file, new_temp_path)
+        if use_vk_cookies:
+            _cookies_vk_temp_path = new_temp_path
+            _cookies_vk_source_mtime = source_mtime
+        else:
+            _cookies_temp_path = new_temp_path
+            _cookies_source_mtime = source_mtime
+        logger.info(f"Copied {cookie_type} cookies to writable location: {new_temp_path} ({cookie_size} bytes)")
+        return new_temp_path
     except Exception as e:
-        logger.error(f"Failed to copy cookies file: {e}")
+        logger.error(f"Failed to copy {cookie_type} cookies file: {e}")
         return None
 
 
@@ -204,14 +277,27 @@ class DownloadSession:
             "extract_flat": False,
             "noplaylist": self.noplaylist,
             "skip_download": True,
+            # Don't require specific format during metadata extraction
+            "format": None,
+            # Ignore errors about unavailable formats during extraction
+            "ignore_no_formats_error": True,
+            # Enable remote components for YouTube JS challenge solving
+            # Required for signature decryption on newer YouTube videos
+            "remote_components": ["ejs:github"],
+            "allow_unplayable_formats": False,
         }
-        # Add cookies if configured (required for YouTube bot detection bypass)
-        cookies_path = _get_writable_cookies_path()
+        # Add cookies if configured - use URL-specific cookies (VK vs general)
+        cookies_path = _get_writable_cookies_path(self.source_url)
         if cookies_path:
             opts["cookiefile"] = str(cookies_path)
+            cookie_type = "VK" if _is_vk_url(self.source_url) else "general"
+            logger.info(f"Using {cookie_type} cookies for metadata extraction: {cookies_path}")
+        else:
+            logger.warning("No cookies file available for metadata extraction")
         # Add proxy if configured (for server IP reputation issues)
         if settings.proxy:
             opts["proxy"] = settings.proxy
+            logger.info(f"Using proxy: {settings.proxy}")
         return opts
 
     def _get_ydl_opts(self) -> dict:
@@ -240,18 +326,24 @@ class DownloadSession:
             "extract_flat": False,
             "writeinfojson": False,
             "writethumbnail": False,
+            # Enable remote components for YouTube JS challenge solving
+            # Must be a list of allowed remote component sources
+            "remote_components": ["ejs:github"],
             # No postprocessors - merge_output_format handles container format
             # during download, enabling true streaming-while-downloading
         }
         
-        # Add cookies if configured (required for YouTube bot detection bypass)
-        cookies_path = _get_writable_cookies_path()
+        # Add cookies if configured - use URL-specific cookies (VK vs general)
+        cookies_path = _get_writable_cookies_path(self.source_url)
         if cookies_path:
             opts["cookiefile"] = str(cookies_path)
+            cookie_type = "VK" if _is_vk_url(self.source_url) else "general"
+            logger.debug(f"Using {cookie_type} cookies for download: {cookies_path}")
         
         # Add proxy if configured (for server IP reputation issues)
         if settings.proxy:
             opts["proxy"] = settings.proxy
+            logger.debug(f"Using proxy for download: {settings.proxy}")
         
         # Add file size limit if configured
         if self.max_filesize:
@@ -263,30 +355,40 @@ class DownloadSession:
         """Map quality setting to yt-dlp format selector with flexible fallbacks."""
         # Format selection strategy:
         # 1. Try preferred mp4/m4a combination (most compatible)
-        # 2. Fall back to any video+audio (yt-dlp will merge)
-        # 3. Final fallback to best single format
+        # 2. Fall back to any video+audio with height constraint
+        # 3. Fall back to any video+audio (yt-dlp will merge)
+        # 4. Fall back to best single format with container preference
+        # 5. Ultimate fallback to literally anything available
         quality_map = {
             "best": (
                 "bestvideo[ext=mp4]+bestaudio[ext=m4a]/"
+                "bestvideo[ext=mp4]+bestaudio/"
+                "bestvideo+bestaudio[ext=m4a]/"
                 "bestvideo+bestaudio/"
-                "best[ext=mp4]/best"
+                "best[ext=mp4]/best[ext=webm]/best"
             ),
             "high": (
                 "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/"
+                "bestvideo[height<=1080][ext=mp4]+bestaudio/"
                 "bestvideo[height<=1080]+bestaudio/"
+                "bestvideo+bestaudio/"
                 "best[height<=1080][ext=mp4]/best[height<=1080]/best"
             ),
             "medium": (
                 "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/"
+                "bestvideo[height<=720][ext=mp4]+bestaudio/"
                 "bestvideo[height<=720]+bestaudio/"
+                "bestvideo+bestaudio/"
                 "best[height<=720][ext=mp4]/best[height<=720]/best"
             ),
             "low": (
                 "bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/"
+                "bestvideo[height<=480][ext=mp4]+bestaudio/"
                 "bestvideo[height<=480]+bestaudio/"
+                "bestvideo+bestaudio/"
                 "best[height<=480][ext=mp4]/best[height<=480]/best"
             ),
-            "audio": "bestaudio[ext=m4a]/bestaudio/best",
+            "audio": "bestaudio[ext=m4a]/bestaudio[ext=mp3]/bestaudio/best",
         }
         return quality_map.get(self.quality, quality_map["best"])
 
@@ -357,6 +459,12 @@ class DownloadSession:
 
     def _sync_extract_info(self, opts: dict) -> dict:
         """Synchronously extract video info."""
+        # Log the options being used (without sensitive data)
+        safe_opts = {k: v for k, v in opts.items() if k != "cookiefile"}
+        if "cookiefile" in opts:
+            safe_opts["cookiefile"] = f"{opts['cookiefile']} (exists: {Path(opts['cookiefile']).exists()})"
+        logger.debug(f"yt-dlp extract options: {safe_opts}")
+        
         with yt_dlp.YoutubeDL(opts) as ydl:
             return ydl.extract_info(self.source_url, download=False)
 

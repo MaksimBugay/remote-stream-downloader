@@ -51,14 +51,48 @@ async def lifespan(app: FastAPI):
     _download_semaphore = asyncio.Semaphore(settings.max_concurrent_downloads)
     settings.temp_download_dir.mkdir(parents=True, exist_ok=True)
     
-    # Log cookies file status
-    if settings.cookies_file:
-        if settings.cookies_file.exists():
-            logger.info(f"Cookies file configured and found: {settings.cookies_file}")
+    # Log cookies file status with detailed info
+    def _log_cookies_file(file_path: Path | None, label: str):
+        if file_path:
+            logger.info(f"{label} cookies file path: {file_path}")
+            if file_path.exists():
+                cookie_size = file_path.stat().st_size
+                logger.info(f"{label} cookies file found: {file_path} ({cookie_size} bytes)")
+                # Log which domains have cookies (for debugging auth issues)
+                try:
+                    with open(file_path, "r", encoding="utf-8") as f:
+                        domains = set()
+                        for line in f:
+                            line = line.strip()
+                            if line and not line.startswith("#"):
+                                parts = line.split("\t")
+                                if len(parts) >= 1:
+                                    domains.add(parts[0])
+                        if domains:
+                            logger.info(f"{label} cookies file contains {len(domains)} unique domains")
+                            # Check for key video platform domains
+                            video_platforms = {
+                                "youtube": [d for d in domains if "youtube" in d.lower()],
+                                "vk": [d for d in domains if "vk" in d.lower()],
+                                "vimeo": [d for d in domains if "vimeo" in d.lower()],
+                                "rutube": [d for d in domains if "rutube" in d.lower()],
+                                "dzen": [d for d in domains if "dzen" in d.lower()],
+                            }
+                            for platform, platform_domains in video_platforms.items():
+                                if platform_domains:
+                                    logger.info(f"{label} cookies for {platform}: {sorted(platform_domains)}")
+                except Exception as e:
+                    logger.warning(f"Could not parse {label} cookies file for domain info: {e}")
+            else:
+                logger.warning(f"{label} cookies file configured but NOT found: {file_path}")
         else:
-            logger.warning(f"Cookies file configured but NOT found: {settings.cookies_file}")
-    else:
-        logger.info("No cookies file configured (COOKIES_FILE env var not set)")
+            logger.info(f"No {label} cookies file configured")
+    
+    # Log general cookies (COOKIES_FILE)
+    _log_cookies_file(settings.cookies_file, "General")
+    
+    # Log VK-specific cookies (COOKIES_FILE_VK)
+    _log_cookies_file(settings.cookies_file_vk, "VK")
     
     logger.info(
         f"yt-dlp service started. Temp dir: {settings.temp_download_dir}, "
@@ -143,16 +177,24 @@ async def stream_file_while_downloading(
     
     Raises:
         FileSizeExceededError: If file size exceeds max_file_size during download.
+        DownloadError: If download fails before file is created.
     """
     bytes_streamed = 0
+    download_error: Exception | None = None
     
     try:
+        # Wait for file to be created - errors here can be raised since no data sent yet
+        wait_count = 0
+        max_wait = 120  # 30 seconds max wait for file to appear
         while not file_path.exists():
             if download_task.done():
                 exc = download_task.exception()
                 if exc:
                     raise exc
                 raise DownloadError("Download finished but output file not found")
+            wait_count += 1
+            if wait_count > max_wait:
+                raise DownloadError("Timeout waiting for download to start")
             await asyncio.sleep(poll_interval)
 
         async with aiofiles.open(file_path, "rb") as f:
@@ -175,13 +217,23 @@ async def stream_file_while_downloading(
                 if download_task.done():
                     exc = download_task.exception()
                     if exc:
-                        raise exc
+                        # Once we've started streaming, we can't raise an HTTP error.
+                        # Log the error and end the stream gracefully.
+                        # The client will receive an incomplete file.
+                        logger.error(f"Download failed after streaming {bytes_streamed / (1024*1024):.1f}MB: {exc}")
+                        download_error = exc
                     break
                 await asyncio.sleep(poll_interval)
+        
+        if download_error:
+            logger.warning(f"Stream ended due to download error (client received {bytes_streamed / (1024*1024):.1f}MB)")
+        else:
+            logger.info(f"Stream completed successfully ({bytes_streamed / (1024*1024):.1f}MB)")
+            
     finally:
         try:
             cleanup_callback()
-            logger.info(f"Cleaned up session after streaming ({bytes_streamed / (1024*1024):.1f}MB)")
+            logger.info(f"Cleaned up session after streaming")
         except Exception as e:
             logger.error(f"Cleanup error: {e}")
 
@@ -219,6 +271,66 @@ async def health_check() -> dict:
         "active_downloads": _active_downloads,
         "max_concurrent_downloads": settings.max_concurrent_downloads,
     }
+
+
+@app.get("/debug/cookies")
+async def debug_cookies() -> dict:
+    """Debug endpoint to check cookies file status and content."""
+    result = {
+        "cookies_file_configured": str(settings.cookies_file) if settings.cookies_file else None,
+        "cookies_file_exists": False,
+        "cookies_file_size": 0,
+        "total_domains": 0,
+        "video_platform_domains": {},
+        "vk_cookies_count": 0,
+        "sample_vk_cookies": [],
+    }
+    
+    if not settings.cookies_file:
+        return result
+    
+    result["cookies_file_exists"] = settings.cookies_file.exists()
+    
+    if not settings.cookies_file.exists():
+        return result
+    
+    result["cookies_file_size"] = settings.cookies_file.stat().st_size
+    
+    try:
+        with open(settings.cookies_file, "r", encoding="utf-8") as f:
+            domains = set()
+            vk_cookies = []
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    parts = line.split("\t")
+                    if len(parts) >= 7:
+                        domain = parts[0]
+                        cookie_name = parts[5]
+                        domains.add(domain)
+                        # Collect VK cookies info (without values for security)
+                        if "vk" in domain.lower():
+                            vk_cookies.append({
+                                "domain": domain,
+                                "name": cookie_name,
+                                "path": parts[2],
+                            })
+            
+            result["total_domains"] = len(domains)
+            result["vk_cookies_count"] = len(vk_cookies)
+            result["sample_vk_cookies"] = vk_cookies[:20]  # First 20 VK cookies
+            
+            # Categorize video platform domains
+            result["video_platform_domains"] = {
+                "youtube": sorted([d for d in domains if "youtube" in d.lower()]),
+                "vk": sorted([d for d in domains if "vk" in d.lower()]),
+                "vimeo": sorted([d for d in domains if "vimeo" in d.lower()]),
+                "rutube": sorted([d for d in domains if "rutube" in d.lower()]),
+            }
+    except Exception as e:
+        result["error"] = str(e)
+    
+    return result
 
 
 @app.get("/download")

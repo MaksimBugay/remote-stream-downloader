@@ -1,7 +1,7 @@
 # yt-dlp FastAPI Microservice
 # Multi-stage build for optimal image size
 
-FROM python:3.12-slim AS builder
+FROM python:3.14.2-slim AS builder
 
 # Set build-time environment
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -22,7 +22,7 @@ RUN pip install --target=/build/deps -r requirements.txt
 
 
 # Production stage
-FROM python:3.12-slim
+FROM python:3.14.2-slim
 
 # Labels for container metadata
 LABEL org.opencontainers.image.title="yt-dlp Streaming Service" \
@@ -35,7 +35,7 @@ LABEL org.opencontainers.image.title="yt-dlp Streaming Service" \
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PYTHONPATH=/app/deps \
-    # Application settings (can be overridden)
+    DENO_DIR=/tmp/deno-cache \
     HOST=0.0.0.0 \
     PORT=8000 \
     METADATA_TIMEOUT_SECONDS=300 \
@@ -47,12 +47,22 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-# Install runtime dependencies (ffmpeg is required for yt-dlp merging)
+# Install runtime dependencies
+# - ffmpeg: required for yt-dlp merging video/audio streams
+# - nodejs: required for yt-dlp YouTube extraction (JS runtime for signature decryption)
+# - curl/unzip: needed for deno installation
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
+    curl \
+    unzip \
     && rm -rf /var/lib/apt/lists/* \
     && mkdir -p /tmp/yt-dlp-downloads \
     && chmod 777 /tmp/yt-dlp-downloads
+
+# Install Deno (recommended JS runtime for yt-dlp)
+# Using official install script and moving to system path
+RUN curl -fsSL https://deno.land/install.sh | DENO_INSTALL=/usr/local sh \
+    && deno --version
 
 # Copy Python dependencies from builder
 COPY --from=builder /build/deps /app/deps
@@ -62,7 +72,8 @@ COPY app/ /app/app/
 
 # Create non-root user for security
 RUN useradd --create-home --shell /bin/bash appuser \
-    && chown -R appuser:appuser /app /tmp/yt-dlp-downloads
+    && mkdir -p /tmp/deno-cache \
+    && chown -R appuser:appuser /app /tmp/yt-dlp-downloads /tmp/deno-cache
 
 USER appuser
 

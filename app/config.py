@@ -37,9 +37,13 @@ class Settings(BaseSettings):
     # File size limits
     max_file_size_bytes: int = 1024 * 1024 * 1024  # 1GB default limit
     
-    # Cookie file for YouTube authentication (to bypass bot detection)
+    # Cookie file for general authentication (YouTube, etc.)
     # Export cookies from browser using: yt-dlp --cookies-from-browser chrome --cookies cookies.txt
     cookies_file: Path | None = None
+    
+    # Cookie file specifically for VK/VKVideo (vk.com, vkvideo.ru)
+    # VK often requires separate session cookies
+    cookies_file_vk: Path | None = None
     
     # Proxy for yt-dlp (to bypass IP-based bot detection on servers)
     # Format: http://user:pass@host:port or socks5://host:port
