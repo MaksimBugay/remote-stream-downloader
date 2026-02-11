@@ -167,6 +167,10 @@ class VideoMetadata:
     video_id: str
     filesize: int | None  # bytes (exact if known)
     filesize_approx: int | None  # bytes (approximate estimate)
+    # Direct URL to a low-quality video stream (for thumbnail generation via ffmpeg)
+    video_stream_url: str | None = None
+    # HTTP headers required to access the video stream URL (User-Agent, Cookie, etc.)
+    video_stream_headers: dict[str, str] | None = None
 
     @property
     def estimated_size(self) -> int | None:
@@ -439,6 +443,33 @@ class DownloadSession:
                 if total_size > 0:
                     filesize_approx = total_size
         
+        # Find the lowest-quality video stream URL for thumbnail generation.
+        # Prefer direct HTTP(S) formats with video codec, sorted by resolution
+        # ascending so we download minimal data if ffmpeg extraction is needed.
+        video_stream_url = None
+        video_stream_headers = None
+        formats = info.get("formats") or []
+        video_formats = [
+            f for f in formats
+            if f.get("vcodec") and f.get("vcodec") != "none" and f.get("url")
+        ]
+        if video_formats:
+            # Sort: prefer direct HTTP(S) protocols, then by lowest height
+            def _thumb_sort_key(f: dict) -> tuple[int, int]:
+                protocol = f.get("protocol", "")
+                is_direct = 0 if protocol in ("https", "http", "") else 1
+                height = f.get("height") or 9999
+                return (is_direct, height)
+
+            video_formats.sort(key=_thumb_sort_key)
+            best = video_formats[0]
+            video_stream_url = best.get("url")
+            video_stream_headers = best.get("http_headers")
+        elif info.get("url"):
+            # Single-format video: use its URL directly
+            video_stream_url = info.get("url")
+            video_stream_headers = info.get("http_headers")
+
         self.metadata = VideoMetadata(
             title=info.get("title", "Unknown Title"),
             uploader=info.get("uploader") or info.get("channel"),
@@ -450,6 +481,8 @@ class DownloadSession:
             video_id=info.get("id", self.session_id),
             filesize=filesize,
             filesize_approx=filesize_approx,
+            video_stream_url=video_stream_url,
+            video_stream_headers=video_stream_headers,
         )
 
         # Pre-compose the filename

@@ -1,7 +1,7 @@
 # yt-dlp FastAPI Microservice
 # Multi-stage build for optimal image size
 
-FROM python:3.14.2-slim AS builder
+FROM python:3.14.3-slim AS builder
 
 # Set build-time environment
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -22,7 +22,7 @@ RUN pip install --target=/build/deps -r requirements.txt
 
 
 # Production stage
-FROM python:3.14.2-slim
+FROM python:3.14.3-slim
 
 # Labels for container metadata
 LABEL org.opencontainers.image.title="yt-dlp Streaming Service" \
@@ -35,7 +35,9 @@ LABEL org.opencontainers.image.title="yt-dlp Streaming Service" \
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PYTHONPATH=/app/deps \
+    # Deno cache directory (for yt-dlp JS runtime)
     DENO_DIR=/tmp/deno-cache \
+    # Application settings (can be overridden)
     HOST=0.0.0.0 \
     PORT=8000 \
     METADATA_TIMEOUT_SECONDS=300 \

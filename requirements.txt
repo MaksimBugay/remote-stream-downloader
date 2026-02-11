@@ -1,9 +1,9 @@
 # yt-dlp Microservice Dependencies
-# Latest versions as of January 2026
+# Latest versions as of February 10, 2026
 
-fastapi>=0.128.0
+fastapi>=0.128.6
 uvicorn[standard]>=0.40.0
-yt-dlp>=2025.12.8
+yt-dlp>=2026.02.04
 python-multipart>=0.0.22
 pydantic>=2.12.5
 pydantic-settings>=2.12.0

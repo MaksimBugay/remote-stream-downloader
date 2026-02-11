@@ -26,6 +26,10 @@ class Settings(BaseSettings):
 
     # Streaming settings
     stream_chunk_size: int = 1024 * 1024  # 1MB chunks by default
+    # Max time to wait for output file to appear before streaming can begin
+    # For videos with separate video+audio tracks, yt-dlp must download both
+    # and merge with ffmpeg before the output file exists
+    file_wait_timeout_seconds: int = 900  # 15 minutes (big files can take long to merge)
 
     # Storage settings
     temp_download_dir: Path = Path("/tmp/yt-dlp-downloads")
