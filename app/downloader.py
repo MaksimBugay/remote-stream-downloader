@@ -17,12 +17,6 @@ from app.config import settings
 
 logger = logging.getLogger(__name__)
 
-# Writable copy of cookies files (yt-dlp needs write access to update cookies)
-_cookies_temp_path: Path | None = None
-_cookies_source_mtime: float | None = None
-_cookies_vk_temp_path: Path | None = None
-_cookies_vk_source_mtime: float | None = None
-
 # VK domain patterns
 VK_DOMAINS = ("vk.com", "vkvideo.ru", "vk.ru", "vk-video.ru")
 
@@ -33,100 +27,17 @@ def _is_vk_url(url: str) -> bool:
     return any(domain in url_lower for domain in VK_DOMAINS)
 
 
-def _get_writable_cookies_path(url: str | None = None) -> Path | None:
+def _get_cookies_source_file(url: str | None = None) -> tuple[Path | None, str]:
     """
-    Get a writable copy of the cookies file.
-    
-    yt-dlp needs write access to update session cookies.
-    This copies the original cookies file to a writable temp location.
-    Automatically refreshes if the source file is modified.
-    
-    Args:
-        url: The video URL. If it's a VK URL and cookies_file_vk is configured,
-             the VK-specific cookies will be used.
+    Select source cookies file and type for a URL.
+
+    Returns:
+        Tuple of (source_file_path, cookie_type_label).
     """
-    global _cookies_temp_path, _cookies_source_mtime
-    global _cookies_vk_temp_path, _cookies_vk_source_mtime
-    
-    # Determine which cookies file to use based on URL
     use_vk_cookies = url and _is_vk_url(url) and settings.cookies_file_vk
-    
     if use_vk_cookies:
-        source_file = settings.cookies_file_vk
-        temp_path_ref = "_cookies_vk_temp_path"
-        mtime_ref = "_cookies_vk_source_mtime"
-        temp_filename = "cookies-vk.txt"
-        cookie_type = "VK"
-    else:
-        source_file = settings.cookies_file
-        temp_path_ref = "_cookies_temp_path"
-        mtime_ref = "_cookies_source_mtime"
-        temp_filename = "cookies.txt"
-        cookie_type = "general"
-    
-    if not source_file:
-        logger.debug(f"No {cookie_type} cookies file configured")
-        return None
-    
-    logger.debug(f"Checking {cookie_type} cookies file: {source_file}")
-    
-    if not source_file.exists():
-        logger.warning(f"{cookie_type} cookies file not found: {source_file}")
-        # Fall back to general cookies if VK cookies not found
-        if use_vk_cookies and settings.cookies_file and settings.cookies_file.exists():
-            logger.info("Falling back to general cookies file for VK URL")
-            return _get_writable_cookies_path(None)  # Recursively get general cookies
-        return None
-    
-    # Get source file info
-    source_stat = source_file.stat()
-    cookie_size = source_stat.st_size
-    source_mtime = source_stat.st_mtime
-    
-    logger.debug(f"{cookie_type} cookies file exists, size: {cookie_size} bytes, mtime: {source_mtime}")
-    
-    # Get current cached values
-    if use_vk_cookies:
-        cached_temp_path = _cookies_vk_temp_path
-        cached_mtime = _cookies_vk_source_mtime
-    else:
-        cached_temp_path = _cookies_temp_path
-        cached_mtime = _cookies_source_mtime
-    
-    # Check if we need to refresh the cached copy
-    needs_refresh = False
-    if cached_temp_path and cached_temp_path.exists():
-        # Refresh if source file was modified
-        if cached_mtime is not None and source_mtime > cached_mtime:
-            logger.info(f"Source {cookie_type} cookies file was modified, refreshing cached copy")
-            needs_refresh = True
-        else:
-            logger.debug(f"Using cached {cookie_type} cookies at: {cached_temp_path}")
-            return cached_temp_path
-    else:
-        needs_refresh = True
-    
-    if not needs_refresh:
-        return cached_temp_path
-    
-    # Ensure temp directory exists
-    settings.temp_download_dir.mkdir(parents=True, exist_ok=True)
-    
-    # Copy to writable temp directory
-    new_temp_path = settings.temp_download_dir / temp_filename
-    try:
-        shutil.copy2(source_file, new_temp_path)
-        if use_vk_cookies:
-            _cookies_vk_temp_path = new_temp_path
-            _cookies_vk_source_mtime = source_mtime
-        else:
-            _cookies_temp_path = new_temp_path
-            _cookies_source_mtime = source_mtime
-        logger.info(f"Copied {cookie_type} cookies to writable location: {new_temp_path} ({cookie_size} bytes)")
-        return new_temp_path
-    except Exception as e:
-        logger.error(f"Failed to copy {cookie_type} cookies file: {e}")
-        return None
+        return settings.cookies_file_vk, "VK"
+    return settings.cookies_file, "general"
 
 
 class DownloadError(Exception):
@@ -272,6 +183,56 @@ class DownloadSession:
         self.output_file: Path | None = None
         self.metadata: VideoMetadata | None = None
         self._composed_filename: str | None = None
+        self._cookies_temp_path: Path | None = None
+        self._cookies_source_mtime: float | None = None
+
+    def _get_writable_cookies_path(self) -> Path | None:
+        """
+        Get a per-session writable cookies copy for yt-dlp.
+
+        The source cookies file is shared/read-only, but each download session
+        gets its own writable copy in the unique session directory to avoid
+        cross-request races when yt-dlp updates cookies.
+        """
+        source_file, cookie_type = _get_cookies_source_file(self.source_url)
+        if not source_file:
+            logger.debug(f"No {cookie_type} cookies file configured")
+            return None
+        if not source_file.exists():
+            logger.warning(f"{cookie_type} cookies file not found: {source_file}")
+            if cookie_type == "VK" and settings.cookies_file and settings.cookies_file.exists():
+                logger.info("Falling back to general cookies file for VK URL")
+                source_file = settings.cookies_file
+                cookie_type = "general"
+            else:
+                return None
+
+        source_stat = source_file.stat()
+        source_mtime = source_stat.st_mtime
+        cookie_size = source_stat.st_size
+
+        if self._cookies_temp_path and self._cookies_temp_path.exists():
+            if self._cookies_source_mtime is not None and source_mtime <= self._cookies_source_mtime:
+                return self._cookies_temp_path
+
+        self.session_dir.mkdir(parents=True, exist_ok=True)
+        target_name = "cookies-vk.txt" if cookie_type == "VK" else "cookies.txt"
+        target_path = self.session_dir / target_name
+
+        try:
+            shutil.copy2(source_file, target_path)
+            self._cookies_temp_path = target_path
+            self._cookies_source_mtime = source_mtime
+            logger.info(
+                "Copied %s cookies to session location: %s (%d bytes)",
+                cookie_type,
+                target_path,
+                cookie_size,
+            )
+            return target_path
+        except Exception as e:
+            logger.error(f"Failed to copy {cookie_type} cookies file: {e}")
+            return None
 
     def _get_extract_opts(self) -> dict:
         """Build yt-dlp options for metadata extraction only."""
@@ -291,7 +252,7 @@ class DownloadSession:
             "allow_unplayable_formats": False,
         }
         # Add cookies if configured - use URL-specific cookies (VK vs general)
-        cookies_path = _get_writable_cookies_path(self.source_url)
+        cookies_path = self._get_writable_cookies_path()
         if cookies_path:
             opts["cookiefile"] = str(cookies_path)
             cookie_type = "VK" if _is_vk_url(self.source_url) else "general"
@@ -304,19 +265,19 @@ class DownloadSession:
             logger.info(f"Using proxy: {settings.proxy}")
         return opts
 
+    # Fixed disk filename for yt-dlp output (no Unicode — avoids all encoding
+    # and sanitization mismatches).  The *real* user-facing filename with full
+    # Unicode support (Russian, CJK, etc.) is set only in HTTP response headers
+    # via get_filename() / compose_filename().
+    _DISK_FILENAME_STEM = "output"
+
     def _get_ydl_opts(self) -> dict:
         """Build yt-dlp options dictionary for download."""
         format_selector = self._get_format_selector()
 
-        # Use composed filename if metadata was extracted
-        if self._composed_filename:
-            output_template = str(self.session_dir / self._composed_filename)
-            # Remove extension as yt-dlp will add it
-            if output_template.endswith(f".{self.merge_format}"):
-                output_template = output_template[: -(len(self.merge_format) + 1)]
-            output_template += ".%(ext)s"
-        else:
-            output_template = str(self.session_dir / "%(title)s.%(ext)s")
+        # Use a fixed ASCII filename on disk — the human-readable Unicode name
+        # is only used in HTTP response headers, not on the filesystem
+        output_template = str(self.session_dir / f"{self._DISK_FILENAME_STEM}.%(ext)s")
 
         opts = {
             "format": format_selector,
@@ -338,7 +299,7 @@ class DownloadSession:
         }
         
         # Add cookies if configured - use URL-specific cookies (VK vs general)
-        cookies_path = _get_writable_cookies_path(self.source_url)
+        cookies_path = self._get_writable_cookies_path()
         if cookies_path:
             opts["cookiefile"] = str(cookies_path)
             cookie_type = "VK" if _is_vk_url(self.source_url) else "general"
@@ -591,23 +552,25 @@ class DownloadSession:
         return 0
 
     def get_expected_output_path(self) -> Path:
-        """Get the expected output file path for streaming."""
-        filename = self.get_filename()
-        return self.session_dir / filename
+        """
+        Get the expected output file path for streaming.
+        
+        Returns the deterministic disk path (output.<ext>) where yt-dlp writes
+        the merged file.  The human-readable Unicode filename is only used in
+        HTTP response headers, not on the filesystem.
+        """
+        return self.session_dir / f"{self._DISK_FILENAME_STEM}.{self.merge_format}"
 
     def get_filename(self) -> str:
         """
-        Get the filename of the downloaded file.
+        Get the user-facing filename for HTTP response headers.
 
-        Returns filename from metadata if available, otherwise from actual file.
+        Returns a Unicode-safe filename from metadata (supports Russian, CJK,
+        etc.).  This name is NOT used on disk — only in Content-Disposition and
+        X-Filename headers.
         """
-        # Use pre-composed filename from metadata
         if self._composed_filename:
             return self._sanitize_filename(self._composed_filename)
-
-        # Fallback to actual file name
-        if self.output_file:
-            return self._sanitize_filename(self.output_file.name)
 
         return f"download.{self.merge_format}"
 

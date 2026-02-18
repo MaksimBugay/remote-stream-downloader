@@ -35,6 +35,12 @@ LABEL org.opencontainers.image.title="yt-dlp Streaming Service" \
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PYTHONPATH=/app/deps \
+    # UTF-8 locale: critical for non-ASCII filenames (Russian, CJK, etc.)
+    # python:slim uses C locale (ASCII) by default — files with Cyrillic/Unicode
+    # names would fail or produce garbled output without this
+    LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8 \
+    PYTHONIOENCODING=utf-8 \
     # Deno cache directory (for yt-dlp JS runtime)
     DENO_DIR=/tmp/deno-cache \
     # Application settings (can be overridden)

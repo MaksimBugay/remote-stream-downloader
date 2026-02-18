@@ -263,6 +263,51 @@ async def _deferred_cleanup(
         logger.error(f"Deferred cleanup error: {e}")
 
 
+def _resolve_actual_output_file(expected_path: Path) -> Path | None:
+    """
+    Resolve the real output file if yt-dlp produced a different extension.
+
+    yt-dlp can complete successfully while writing `output.<other_ext>` even when
+    `merge_output_format` is requested, depending on source formats and remuxing.
+    """
+    if expected_path.exists():
+        return expected_path
+
+    session_dir = expected_path.parent
+    if not session_dir.exists():
+        return None
+
+    # Prefer files that keep the deterministic stem ("output.*").
+    stem_matches = [
+        p for p in session_dir.glob(f"{expected_path.stem}.*")
+        if p.is_file()
+    ]
+    if stem_matches:
+        preferred_order = {"mp4": 0, "mkv": 1, "webm": 2, "m4a": 3, "mp3": 4}
+        return min(
+            stem_matches,
+            key=lambda p: (
+                preferred_order.get(p.suffix.lstrip(".").lower(), 99),
+                -p.stat().st_size,
+            ),
+        )
+
+    # Fallback: choose the largest non-temp media-ish file in session dir.
+    candidates = [
+        p for p in session_dir.iterdir()
+        if p.is_file() and p.suffix.lower() not in {".part", ".ytdl", ".tmp"}
+    ]
+    # Some extractors may place artifacts in nested dirs; check recursively too.
+    if not candidates:
+        candidates = [
+            p for p in session_dir.rglob("*")
+            if p.is_file() and p.suffix.lower() not in {".part", ".ytdl", ".tmp"}
+        ]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda p: p.stat().st_size)
+
+
 async def stream_file_while_downloading(
     file_path: Path,
     chunk_size: int,
@@ -288,6 +333,7 @@ async def stream_file_while_downloading(
     """
     bytes_streamed = 0
     download_error: Exception | None = None
+    stream_path = file_path
     
     try:
         # Wait for file to be created - errors here can be raised since no data sent yet
@@ -298,28 +344,51 @@ async def stream_file_while_downloading(
         max_wait = int(max_wait_seconds / poll_interval)
         last_log_time = 0.0
         
-        while not file_path.exists():
+        while not stream_path.exists():
             if download_task.done():
                 exc = download_task.exception()
                 if exc:
                     raise exc
-                # Check if file appeared right before task completed
-                if file_path.exists():
+                # Download finished successfully, resolve the actual output path.
+                resolved = _resolve_actual_output_file(stream_path)
+                if resolved:
+                    if resolved != stream_path:
+                        logger.info(
+                            "Expected output file %s not found, using %s instead",
+                            stream_path.name,
+                            resolved.name,
+                        )
+                    stream_path = resolved
                     break
+                # Emit detailed diagnostics to help identify extractor-specific
+                # output patterns that don't follow expected naming.
+                if stream_path.parent.exists():
+                    files_snapshot = sorted(
+                        f"{p.name} ({p.stat().st_size}B)"
+                        for p in stream_path.parent.rglob("*")
+                        if p.is_file()
+                    )
+                    logger.error(
+                        "Download finished with no resolvable output file. "
+                        "expected=%s, session_dir=%s, files=%s",
+                        stream_path.name,
+                        stream_path.parent,
+                        files_snapshot,
+                    )
                 raise DownloadError("Download finished but output file not found")
             wait_count += 1
             elapsed = wait_count * poll_interval
             
             # Log progress every 30 seconds
             if elapsed - last_log_time >= 30:
-                logger.info(f"Waiting for output file... ({elapsed:.0f}s elapsed, file: {file_path.name})")
+                logger.info(f"Waiting for output file... ({elapsed:.0f}s elapsed, file: {stream_path.name})")
                 last_log_time = elapsed
             
             if wait_count > max_wait:
                 raise DownloadError(f"Timeout waiting for download to start ({max_wait_seconds}s)")
             await asyncio.sleep(poll_interval)
 
-        async with aiofiles.open(file_path, "rb") as f:
+        async with aiofiles.open(stream_path, "rb") as f:
             while True:
                 chunk = await f.read(chunk_size)
                 if chunk:
@@ -414,13 +483,10 @@ async def _monitor_download(
         # Task was cancelled (e.g., client disconnected)
         logger.info("Download monitor task was cancelled")
         raise
-    except FileNotFoundError as e:
-        # This can happen if cleanup runs before ffmpeg finishes merging.
-        # If streaming completed successfully, this is not a problem.
-        logger.warning(f"File not found during download (likely already cleaned up): {e}")
     except Exception as e:
-        # Log unexpected errors to prevent "Task exception was never retrieved"
-        logger.error(f"Unexpected error in download monitor: {type(e).__name__}: {e}")
+        # Preserve failures so the streaming coroutine can surface a real cause.
+        logger.error(f"Download monitor failed: {type(e).__name__}: {e}")
+        raise
 
 
 @app.get("/health")
@@ -582,19 +648,22 @@ async def download_video(
     # Acquire semaphore to limit concurrent downloads
     if _download_semaphore is None:
         raise HTTPException(status_code=503, detail="Service not ready")
-    
+
+    # Bound slot acquisition time so requests don't queue indefinitely.
     try:
-        # Try to acquire immediately, fail fast if at capacity
-        acquired = _download_semaphore.locked()
-        if acquired and _active_downloads >= settings.max_concurrent_downloads:
-            raise HTTPException(
-                status_code=503,
-                detail=f"Server at capacity ({settings.max_concurrent_downloads} concurrent downloads). Try again later.",
-            )
-    except HTTPException:
-        raise
-    
-    await _download_semaphore.acquire()
+        await asyncio.wait_for(
+            _download_semaphore.acquire(),
+            timeout=settings.download_slot_acquire_timeout_seconds,
+        )
+    except asyncio.TimeoutError:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                f"Server at capacity ({settings.max_concurrent_downloads} concurrent downloads). "
+                "Try again later."
+            ),
+        )
+
     _active_downloads += 1
     logger.info(f"Active downloads: {_active_downloads}/{settings.max_concurrent_downloads}")
 
@@ -608,14 +677,23 @@ async def download_video(
         max_filesize=max_file_size,
     )
     
+    cleanup_done = False
+
     def release_and_cleanup() -> None:
         """Release semaphore and cleanup session."""
         global _active_downloads
+        nonlocal cleanup_done
+
+        if cleanup_done:
+            logger.debug("Cleanup already completed for this session, skipping duplicate call")
+            return
+        cleanup_done = True
+
         try:
             session.cleanup()
         finally:
             _download_semaphore.release()
-            _active_downloads -= 1
+            _active_downloads = max(0, _active_downloads - 1)
             logger.info(f"Active downloads: {_active_downloads}/{settings.max_concurrent_downloads}")
     
     cleanup_fn = release_and_cleanup
@@ -682,7 +760,7 @@ async def download_video(
 
         return StreamingResponse(
             content=stream_file_while_downloading(
-                file_path, chunk_size, download_task, cleanup_fn, max_file_size
+                file_path, chunk_size, download_task, cleanup_fn, max_file_size,
             ),
             media_type=media_type,
             headers={
@@ -1064,7 +1142,9 @@ async def download_thumbnail(
             headers={
                 "Content-Disposition": f'inline; filename="{unique_name}"',
                 "X-Thumbnail-Source": source,
-                "X-Video-Title": safe_title[:500],
+                # URL-encoded UTF-8 title (safe_filename is already capped at
+                # 200 UTF-8 bytes, so the encoded form fits HTTP header limits)
+                "X-Video-Title": safe_title,
                 "Cache-Control": "public, max-age=86400",
             },
         )

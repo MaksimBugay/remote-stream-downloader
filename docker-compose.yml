@@ -37,9 +37,16 @@ services:
       # File size limits (1GB default)
       - MAX_FILE_SIZE_BYTES=${MAX_FILE_SIZE_BYTES:-1073741824}
 
+      # Cookie files (optional, for authenticated downloads)
+      # - COOKIES_FILE=/app/cookies-all.txt
+      # - COOKIES_FILE_VK=/app/cookies-vk.txt
+
     # Volume for temporary downloads
     volumes:
       - yt-dlp-temp:/tmp/yt-dlp-downloads
+      # Uncomment to mount cookie files:
+      # - ./cookies-all.txt:/app/cookies-all.txt
+      # - ./cookies-vk.txt:/app/cookies-vk.txt
 
     # Resource limits
     deploy:

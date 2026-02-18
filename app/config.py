@@ -37,6 +37,8 @@ class Settings(BaseSettings):
     
     # Concurrency settings
     max_concurrent_downloads: int = 10  # Prevent server overload
+    # Max time to wait for a download slot before returning 503
+    download_slot_acquire_timeout_seconds: float = 1.0
     
     # File size limits
     max_file_size_bytes: int = 1024 * 1024 * 1024  # 1GB default limit
