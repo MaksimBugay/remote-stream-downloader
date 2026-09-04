@@ -1,15 +1,16 @@
 """
-yt-dlp FastAPI Microservice
+yt-dlp FastAPI Streaming Service
 
-A streaming video download service wrapping yt-dlp with:
-- Configurable quality and format options
-- Disk-buffered streaming with automatic cleanup
-- Concurrent download isolation
-- Execution timeout support
+High-performance video download service:
+- Concurrent fragment downloads via yt-dlp
+- Per-request temp-folder isolation
+- Stream-while-downloading with automatic cleanup
+- No ffmpeg re-encoding — streams whatever yt-dlp produces
 """
 
 import asyncio
 import logging
+import time
 import uuid
 from collections.abc import Callable
 from contextlib import asynccontextmanager
@@ -33,7 +34,6 @@ from app.downloader import (
     MetadataExtractionError,
 )
 
-# Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -41,149 +41,130 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+# ===================================================================
+# Request models
+# ===================================================================
+
+
 class DownloadRequest(BaseModel):
-    """Request body for POST /download endpoint."""
-    
+    """Request body for POST /download."""
+
     url: str = Field(
         ...,
-        description="Video URL (YouTube, Vimeo, LinkedIn, etc.)",
+        description="Video URL (YouTube, Vimeo, VK, etc.)",
         examples=["https://www.youtube.com/watch?v=dQw4w9WgXcQ"],
     )
     quality: str = Field(
-        default="high",
+        default="best",
         description="Video quality: best, high (1080p), medium (720p), low (480p), audio",
     )
-    noplaylist: bool = Field(
-        default=True,
-        description="Download only the video, not the playlist",
-    )
+    noplaylist: bool = Field(default=True)
     concurrent_fragment_downloads: int = Field(
-        default=5,
-        ge=1,
-        le=16,
-        description="Number of concurrent fragment downloads",
-    )
-    merge_output_format: str = Field(
-        default="mp4",
-        pattern="^(mp4|mkv|webm|m4a|mp3)$",
-        description="Output container format",
+        default=settings.default_concurrent_fragments, ge=1, le=16,
     )
     chunk_size: int = Field(
-        default=settings.stream_chunk_size,
-        ge=1024,
-        le=10485760,
-        description="Streaming chunk size in bytes (default 1MB)",
+        default=settings.stream_chunk_size, ge=1024, le=10_485_760,
     )
     metadata_timeout: int = Field(
-        default=settings.metadata_timeout_seconds,
-        ge=10,
-        le=300,
-        description="Metadata extraction timeout in seconds",
+        default=settings.metadata_timeout_seconds, ge=10, le=300,
     )
     download_timeout: int = Field(
-        default=settings.download_timeout_seconds,
-        ge=30,
-        le=7200,
-        description="Download timeout in seconds",
+        default=settings.download_timeout_seconds, ge=30, le=7200,
     )
     max_file_size: int = Field(
-        default=settings.max_file_size_bytes,
-        ge=1024 * 1024,
-        le=10 * 1024 * 1024 * 1024,
-        description="Maximum file size in bytes (default 1GB)",
+        default=settings.max_file_size_bytes, ge=1_048_576, le=10_737_418_240,
+    )
+
+
+class DownloadForWebRequest(BaseModel):
+    """Request body for POST /download-for-web."""
+
+    url: str = Field(
+        ...,
+        description="Video URL (YouTube, Vimeo, VK, etc.)",
+        examples=["https://www.youtube.com/watch?v=dQw4w9WgXcQ"],
+    )
+    quality: str = Field(
+        default="best",
+        description="Video quality: best, high (1080p), medium (720p), low (480p), audio",
+    )
+    noplaylist: bool = Field(default=True)
+    concurrent_fragment_downloads: int = Field(
+        default=settings.default_concurrent_fragments, ge=1, le=16,
+    )
+    chunk_size: int = Field(
+        default=settings.stream_chunk_size, ge=1024, le=10_485_760,
+    )
+    metadata_timeout: int = Field(
+        default=settings.metadata_timeout_seconds, ge=10, le=300,
+    )
+    download_timeout: int = Field(
+        default=settings.download_timeout_seconds, ge=30, le=7200,
+    )
+    max_file_size: int = Field(
+        default=settings.max_file_size_bytes, ge=1_048_576, le=10_737_418_240,
     )
 
 
 class ThumbnailRequest(BaseModel):
-    """Request body for POST /download/thumbnail endpoint."""
+    """Request body for POST /download/thumbnail."""
 
     url: str = Field(
         ...,
-        description="Video URL (YouTube, Vimeo, LinkedIn, etc.)",
+        description="Video URL (YouTube, Vimeo, VK, etc.)",
         examples=["https://www.youtube.com/watch?v=dQw4w9WgXcQ"],
     )
     metadata_timeout: int = Field(
-        default=settings.metadata_timeout_seconds,
-        ge=10,
-        le=300,
-        description="Metadata extraction timeout in seconds",
+        default=settings.metadata_timeout_seconds, ge=10, le=300,
     )
 
 
-# Semaphore for limiting concurrent downloads to prevent resource exhaustion
-_download_semaphore: asyncio.Semaphore | None = None
+# ===================================================================
+# Concurrency & lifespan
+# ===================================================================
+
+_semaphore: asyncio.Semaphore | None = None
 _active_downloads: int = 0
 
 
 @asynccontextmanager
-async def lifespan(app: FastAPI):
-    """Application lifespan manager for startup/shutdown tasks."""
-    global _download_semaphore
-    
-    # Startup: initialize concurrency limiter and temp directory
-    _download_semaphore = asyncio.Semaphore(settings.max_concurrent_downloads)
+async def lifespan(_app: FastAPI):
+    global _semaphore
+    _semaphore = asyncio.Semaphore(settings.max_concurrent_downloads)
     settings.temp_download_dir.mkdir(parents=True, exist_ok=True)
-    
-    # Log cookies file status with detailed info
-    def _log_cookies_file(file_path: Path | None, label: str):
-        if file_path:
-            logger.info(f"{label} cookies file path: {file_path}")
-            if file_path.exists():
-                cookie_size = file_path.stat().st_size
-                logger.info(f"{label} cookies file found: {file_path} ({cookie_size} bytes)")
-                # Log which domains have cookies (for debugging auth issues)
-                try:
-                    with open(file_path, "r", encoding="utf-8") as f:
-                        domains = set()
-                        for line in f:
-                            line = line.strip()
-                            if line and not line.startswith("#"):
-                                parts = line.split("\t")
-                                if len(parts) >= 1:
-                                    domains.add(parts[0])
-                        if domains:
-                            logger.info(f"{label} cookies file contains {len(domains)} unique domains")
-                            # Check for key video platform domains
-                            video_platforms = {
-                                "youtube": [d for d in domains if "youtube" in d.lower()],
-                                "vk": [d for d in domains if "vk" in d.lower()],
-                                "vimeo": [d for d in domains if "vimeo" in d.lower()],
-                                "rutube": [d for d in domains if "rutube" in d.lower()],
-                                "dzen": [d for d in domains if "dzen" in d.lower()],
-                            }
-                            for platform, platform_domains in video_platforms.items():
-                                if platform_domains:
-                                    logger.info(f"{label} cookies for {platform}: {sorted(platform_domains)}")
-                except Exception as e:
-                    logger.warning(f"Could not parse {label} cookies file for domain info: {e}")
+
+    for label, path in [
+        ("General", settings.cookies_file),
+        ("VK", settings.cookies_file_vk),
+    ]:
+        if path:
+            if path.exists():
+                logger.info(
+                    "%s cookies: %s (%d bytes)", label, path, path.stat().st_size,
+                )
             else:
-                logger.warning(f"{label} cookies file configured but NOT found: {file_path}")
+                logger.warning(
+                    "%s cookies configured but missing: %s", label, path,
+                )
         else:
-            logger.info(f"No {label} cookies file configured")
-    
-    # Log general cookies (COOKIES_FILE)
-    _log_cookies_file(settings.cookies_file, "General")
-    
-    # Log VK-specific cookies (COOKIES_FILE_VK)
-    _log_cookies_file(settings.cookies_file_vk, "VK")
-    
+            logger.info("No %s cookies configured", label)
+
     logger.info(
-        f"yt-dlp service started. Temp dir: {settings.temp_download_dir}, "
-        f"max concurrent: {settings.max_concurrent_downloads}"
+        "Service started — temp=%s, max_concurrent=%d",
+        settings.temp_download_dir,
+        settings.max_concurrent_downloads,
     )
     yield
-    # Shutdown: cleanup could be added here if needed
-    logger.info("yt-dlp service shutting down")
+    logger.info("Service shutting down")
 
 
 app = FastAPI(
     title="yt-dlp Streaming Service",
-    description="Download and stream videos from YouTube and similar platforms",
-    version="1.0.0",
+    description="Download and stream videos via yt-dlp",
+    version="2.0.0",
     lifespan=lifespan,
 )
 
-# CORS middleware with Access-Control-Allow-Origin: *
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -200,298 +181,396 @@ app.add_middleware(
 )
 
 
-async def stream_file_with_cleanup(
-    file_path: Path,
+# ===================================================================
+# Helpers
+# ===================================================================
+
+_MIME: dict[str, str] = {
+    "mp4": "video/mp4",
+    "mkv": "video/x-matroska",
+    "webm": "video/webm",
+    "m4a": "audio/mp4",
+    "mp3": "audio/mpeg",
+    "ogg": "audio/ogg",
+    "opus": "audio/opus",
+}
+
+
+def _media_type(ext: str) -> str:
+    return _MIME.get(ext.lower(), "application/octet-stream")
+
+
+def _decode_url(url: str) -> str:
+    """Decode a URL that may have been fully percent-encoded (e.g. by a frontend).
+
+    Only decodes when the entire URL appears to be encoded — i.e. it doesn't
+    start with a scheme.  Already-valid URLs are returned as-is to avoid
+    corrupting percent-encoded characters in their query strings.
+    """
+    if not url:
+        return url
+    if not url.startswith(("http://", "https://")):
+        decoded = unquote(url)
+        if decoded.startswith(("http://", "https://")):
+            return decoded
+    return url
+
+
+def _replace_ext(filename: str, ext: str) -> str:
+    ext = ext.lstrip(".").strip().lower()
+    if not ext:
+        return filename
+    dot = filename.rfind(".")
+    return f"{filename[:dot]}.{ext}" if dot > 0 else f"{filename}.{ext}"
+
+
+# ===================================================================
+# Streaming core
+# ===================================================================
+
+
+async def _wait_for_output(
+    expected: Path,
+    task: asyncio.Task,
+    session: DownloadSession,
+    poll: float = 0.25,
+) -> Path:
+    """Poll until yt-dlp produces a streamable output file."""
+    deadline = time.monotonic() + settings.file_wait_timeout_seconds
+    last_log = 0.0
+    current_poll = poll
+
+    while True:
+        if expected.exists():
+            return expected
+
+        resolved = session.resolve_output()
+        if resolved:
+            if resolved != expected:
+                logger.info(
+                    "Resolved output %s (expected %s)",
+                    resolved.name,
+                    expected.name,
+                )
+            return resolved
+
+        if task.done():
+            exc = task.exception()
+            if exc:
+                raise exc
+            final = session.resolve_output_recursive()
+            if final:
+                return final
+            raise DownloadError("Download finished but no output file found")
+
+        elapsed = settings.file_wait_timeout_seconds - (deadline - time.monotonic())
+        if elapsed - last_log >= 30:
+            logger.info("Waiting for output file… (%.0fs)", elapsed)
+            last_log = elapsed
+        if time.monotonic() >= deadline:
+            raise DownloadError(
+                f"Timeout waiting for output file ({settings.file_wait_timeout_seconds}s)"
+            )
+        await asyncio.sleep(current_poll)
+        current_poll = min(2.0, current_poll * 1.5)
+
+
+async def _stream_and_cleanup(
+    path: Path,
     chunk_size: int,
-    cleanup_callback: Callable[[], None],
+    task: asyncio.Task,
+    download_future: asyncio.Future,
+    cleanup: Callable[[], None],
+    max_size: int | None = None,
+    poll: float = 0.25,
 ) -> AsyncIterator[bytes]:
-    """
-    Stream file contents in chunks, then cleanup after streaming completes.
-
-    Args:
-        file_path: Path to the file to stream.
-        chunk_size: Size of each chunk in bytes.
-        cleanup_callback: Function to call after streaming for cleanup.
-
-    Yields:
-        File content chunks.
-    """
+    """Stream file bytes while the download continues, then clean up."""
+    streamed = 0
     try:
-        async with aiofiles.open(file_path, "rb") as f:
-            while chunk := await f.read(chunk_size):
-                yield chunk
-    except asyncio.CancelledError:
-        logger.warning(f"Stream cancelled for {file_path}")
-        raise
-    except Exception as e:
-        logger.error(f"Error streaming {file_path}: {e}")
-        raise
-    finally:
-        # Cleanup after streaming (success or failure)
-        try:
-            cleanup_callback()
-            logger.info("Cleaned up session after streaming")
-        except Exception as e:
-            logger.error(f"Cleanup error: {e}")
-
-
-async def _deferred_cleanup(
-    download_task: asyncio.Task,
-    cleanup_callback: Callable[[], None],
-    timeout: float = 300,
-) -> None:
-    """
-    Run cleanup after download task finishes.
-    
-    Used when streaming is cancelled (e.g., client disconnect) and we can't
-    await the download in the generator's finally block due to CancelledError.
-    Runs as an independent task that won't be cancelled with the streaming.
-    """
-    try:
-        if not download_task.done():
-            logger.info("Deferred cleanup: waiting for download to finish...")
-            await asyncio.wait_for(download_task, timeout=timeout)
-    except asyncio.TimeoutError:
-        logger.warning(f"Deferred cleanup: download didn't finish within {timeout}s, proceeding")
-        download_task.cancel()
-    except (asyncio.CancelledError, Exception) as e:
-        logger.debug(f"Deferred cleanup: download task ended: {type(e).__name__}: {e}")
-    try:
-        cleanup_callback()
-        logger.info("Deferred cleanup completed")
-    except Exception as e:
-        logger.error(f"Deferred cleanup error: {e}")
-
-
-def _resolve_actual_output_file(expected_path: Path) -> Path | None:
-    """
-    Resolve the real output file if yt-dlp produced a different extension.
-
-    yt-dlp can complete successfully while writing `output.<other_ext>` even when
-    `merge_output_format` is requested, depending on source formats and remuxing.
-    """
-    if expected_path.exists():
-        return expected_path
-
-    session_dir = expected_path.parent
-    if not session_dir.exists():
-        return None
-
-    # Prefer files that keep the deterministic stem ("output.*").
-    stem_matches = [
-        p for p in session_dir.glob(f"{expected_path.stem}.*")
-        if p.is_file()
-    ]
-    if stem_matches:
-        preferred_order = {"mp4": 0, "mkv": 1, "webm": 2, "m4a": 3, "mp3": 4}
-        return min(
-            stem_matches,
-            key=lambda p: (
-                preferred_order.get(p.suffix.lstrip(".").lower(), 99),
-                -p.stat().st_size,
-            ),
-        )
-
-    # Fallback: choose the largest non-temp media-ish file in session dir.
-    candidates = [
-        p for p in session_dir.iterdir()
-        if p.is_file() and p.suffix.lower() not in {".part", ".ytdl", ".tmp"}
-    ]
-    # Some extractors may place artifacts in nested dirs; check recursively too.
-    if not candidates:
-        candidates = [
-            p for p in session_dir.rglob("*")
-            if p.is_file() and p.suffix.lower() not in {".part", ".ytdl", ".tmp"}
-        ]
-    if not candidates:
-        return None
-    return max(candidates, key=lambda p: p.stat().st_size)
-
-
-async def stream_file_while_downloading(
-    file_path: Path,
-    chunk_size: int,
-    download_task: asyncio.Task,
-    cleanup_callback: Callable[[], None],
-    max_file_size: int | None = None,
-    poll_interval: float = 0.25,
-) -> AsyncIterator[bytes]:
-    """
-    Stream a file while it is being downloaded, without Content-Length.
-
-    Args:
-        file_path: Path to the file to stream.
-        chunk_size: Size of each chunk in bytes.
-        download_task: Task that completes when download finishes or fails.
-        cleanup_callback: Function to call after streaming for cleanup.
-        max_file_size: Maximum allowed file size in bytes (None = no limit).
-        poll_interval: Sleep interval while waiting for more data.
-    
-    Raises:
-        FileSizeExceededError: If file size exceeds max_file_size during download.
-        DownloadError: If download fails before file is created.
-    """
-    bytes_streamed = 0
-    download_error: Exception | None = None
-    stream_path = file_path
-    
-    try:
-        # Wait for file to be created - errors here can be raised since no data sent yet
-        # For videos with separate video+audio tracks, yt-dlp downloads both first,
-        # then merges with ffmpeg - this can take a long time for big files
-        wait_count = 0
-        max_wait_seconds = settings.file_wait_timeout_seconds
-        max_wait = int(max_wait_seconds / poll_interval)
-        last_log_time = 0.0
-        
-        while not stream_path.exists():
-            if download_task.done():
-                exc = download_task.exception()
-                if exc:
-                    raise exc
-                # Download finished successfully, resolve the actual output path.
-                resolved = _resolve_actual_output_file(stream_path)
-                if resolved:
-                    if resolved != stream_path:
-                        logger.info(
-                            "Expected output file %s not found, using %s instead",
-                            stream_path.name,
-                            resolved.name,
-                        )
-                    stream_path = resolved
-                    break
-                # Emit detailed diagnostics to help identify extractor-specific
-                # output patterns that don't follow expected naming.
-                if stream_path.parent.exists():
-                    files_snapshot = sorted(
-                        f"{p.name} ({p.stat().st_size}B)"
-                        for p in stream_path.parent.rglob("*")
-                        if p.is_file()
-                    )
-                    logger.error(
-                        "Download finished with no resolvable output file. "
-                        "expected=%s, session_dir=%s, files=%s",
-                        stream_path.name,
-                        stream_path.parent,
-                        files_snapshot,
-                    )
-                raise DownloadError("Download finished but output file not found")
-            wait_count += 1
-            elapsed = wait_count * poll_interval
-            
-            # Log progress every 30 seconds
-            if elapsed - last_log_time >= 30:
-                logger.info(f"Waiting for output file... ({elapsed:.0f}s elapsed, file: {stream_path.name})")
-                last_log_time = elapsed
-            
-            if wait_count > max_wait:
-                raise DownloadError(f"Timeout waiting for download to start ({max_wait_seconds}s)")
-            await asyncio.sleep(poll_interval)
-
-        async with aiofiles.open(stream_path, "rb") as f:
+        async with aiofiles.open(path, "rb") as f:
             while True:
                 chunk = await f.read(chunk_size)
                 if chunk:
-                    bytes_streamed += len(chunk)
-                    
-                    # Check file size limit during streaming
-                    if max_file_size and bytes_streamed > max_file_size:
-                        download_task.cancel()
+                    streamed += len(chunk)
+                    if max_size and streamed > max_size:
+                        task.cancel()
                         raise FileSizeExceededError(
-                            f"File size exceeded {max_file_size / (1024*1024):.1f}MB limit "
-                            f"(streamed {bytes_streamed / (1024*1024):.1f}MB)"
+                            f"Streamed {streamed / 1_048_576:.1f}MB — exceeds "
+                            f"{max_size / 1_048_576:.1f}MB limit"
                         )
-                    
                     yield chunk
                     continue
-                    
-                if download_task.done():
-                    exc = download_task.exception()
+
+                if task.done():
+                    exc = task.exception()
                     if exc:
-                        # Once we've started streaming, we can't raise an HTTP error.
-                        # Log the error and end the stream gracefully.
-                        # The client will receive an incomplete file.
-                        logger.error(f"Download failed after streaming {bytes_streamed / (1024*1024):.1f}MB: {exc}")
-                        download_error = exc
+                        logger.error(
+                            "Download failed after streaming %.1fMB: %s",
+                            streamed / 1_048_576,
+                            exc,
+                        )
+                        raise DownloadError(
+                            f"Download failed after streaming "
+                            f"{streamed / 1_048_576:.1f}MB"
+                        ) from exc
                     break
-                await asyncio.sleep(poll_interval)
-        
-        if download_error:
-            logger.warning(f"Stream ended due to download error (client received {bytes_streamed / (1024*1024):.1f}MB)")
-        else:
-            logger.info(f"Stream completed successfully ({bytes_streamed / (1024*1024):.1f}MB)")
-            
+
+                await asyncio.sleep(poll)
+
+        logger.info("Stream completed (%.1fMB)", streamed / 1_048_576)
+
     finally:
-        # Wait for download task to complete before cleanup
-        # This ensures ffmpeg post-processing finishes before we delete files
-        # For big files, ffmpeg merge can take several minutes
-        if not download_task.done():
-            logger.info("Waiting for download/merge to complete before cleanup...")
+        deferred = False
+        if not task.done():
             try:
-                # Give it plenty of time for ffmpeg merge on large files
-                await asyncio.wait_for(asyncio.shield(download_task), timeout=900)
-                logger.debug("Download task completed normally")
+                await asyncio.wait_for(asyncio.shield(task), timeout=900)
             except asyncio.TimeoutError:
-                logger.warning("Download task timed out (15min) during cleanup wait, proceeding with cleanup")
-                download_task.cancel()
+                logger.warning("Download didn't finish within 15 min of stream end")
+                asyncio.create_task(
+                    _deferred_cleanup(download_future, cleanup, reason="stream-timeout")
+                )
+                deferred = True
             except asyncio.CancelledError:
-                # Streaming was cancelled (e.g., client disconnected).
-                # asyncio.shield protects download_task from cancellation, but the
-                # await itself raises CancelledError in this coroutine. We can't
-                # wait here, so defer cleanup to an independent background task
-                # that will properly wait for the download thread to finish before
-                # deleting session files (avoiding FileNotFoundError in yt-dlp).
-                logger.info("Stream cancelled, deferring cleanup until download finishes")
-                asyncio.create_task(_deferred_cleanup(download_task, cleanup_callback))
-                return
-            except Exception as e:
-                # Log but don't fail - we still need to cleanup
-                logger.debug(f"Download task finished with error during cleanup wait: {type(e).__name__}: {e}")
-        
-        try:
-            cleanup_callback()
-            logger.info("Cleaned up session after streaming")
-        except Exception as e:
-            logger.error(f"Cleanup error: {e}")
+                asyncio.create_task(
+                    _deferred_cleanup(download_future, cleanup, reason="stream-cancelled")
+                )
+                deferred = True
+            except Exception:
+                pass
+        if not deferred:
+            if not download_future.done():
+                asyncio.create_task(
+                    _deferred_cleanup(download_future, cleanup, reason="stream-finished")
+                )
+            else:
+                try:
+                    cleanup()
+                    logger.info("Session cleaned up after streaming")
+                except Exception as exc:
+                    logger.error("Cleanup error: %s", exc)
+
+
+async def _deferred_cleanup(
+    download_future: asyncio.Future,
+    cleanup: Callable[[], None],
+    reason: str = "unknown",
+) -> None:
+    """Background cleanup that waits for executor download to actually finish."""
+    try:
+        if not download_future.done():
+            logger.info("Deferred cleanup waiting for download completion (%s)", reason)
+            await asyncio.shield(download_future)
+    except asyncio.CancelledError:
+        # Keep cleanup task resilient to ambient cancellation.
+        logger.warning("Deferred cleanup task cancelled (%s)", reason)
+        return
+    except Exception as exc:
+        logger.debug("Download finished with error before deferred cleanup: %s", exc)
+    try:
+        cleanup()
+        logger.info("Deferred cleanup done")
+    except Exception as exc:
+        logger.error("Deferred cleanup error: %s", exc)
 
 
 async def _monitor_download(
-    download_future: asyncio.Future,
+    future: asyncio.Future,
     timeout: int,
-    cleanup_callback: Callable[[], None] | None = None,
 ) -> None:
-    """
-    Await download completion with timeout enforcement.
-    
-    On timeout, triggers cleanup to prevent resource leaks from orphaned downloads.
-    Note: This runs as a background task. Exceptions here are logged but may not
-    propagate to the streaming response if streaming has already started.
-    """
+    """Await download with timeout enforcement."""
     try:
-        await asyncio.wait_for(download_future, timeout=timeout)
+        await asyncio.wait_for(future, timeout=timeout)
     except asyncio.TimeoutError:
-        # Cancel the future to stop background download
-        download_future.cancel()
-        # Cleanup resources immediately on timeout
-        if cleanup_callback:
-            try:
-                cleanup_callback()
-            except Exception as e:
-                logger.error(f"Cleanup error on timeout: {e}")
+        # Do NOT cleanup here. run_in_executor work may still be writing;
+        # cleanup must happen only after the executor future truly finishes.
         raise DownloadTimeoutError(f"Download exceeded {timeout}s timeout")
     except asyncio.CancelledError:
-        # Task was cancelled (e.g., client disconnected)
-        logger.info("Download monitor task was cancelled")
         raise
-    except Exception as e:
-        # Preserve failures so the streaming coroutine can surface a real cause.
-        logger.error(f"Download monitor failed: {type(e).__name__}: {e}")
+    except Exception:
         raise
+
+
+# ===================================================================
+# Core download handler (shared by /download and /download-for-web)
+# ===================================================================
+
+
+async def _handle_download(
+    source_url: str,
+    quality: str,
+    noplaylist: bool,
+    concurrent_fragments: int,
+    chunk_size: int,
+    metadata_timeout: int,
+    download_timeout: int,
+    max_file_size: int,
+    merge_output_format: str | None = None,
+) -> StreamingResponse:
+    global _active_downloads
+
+    if _semaphore is None:
+        raise HTTPException(status_code=503, detail="Service not ready")
+
+    try:
+        await asyncio.wait_for(
+            _semaphore.acquire(),
+            timeout=settings.download_slot_acquire_timeout_seconds,
+        )
+    except asyncio.TimeoutError:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                f"Server at capacity ({settings.max_concurrent_downloads} "
+                "concurrent downloads). Try again later."
+            ),
+        )
+
+    _active_downloads += 1
+    logger.info(
+        "Active downloads: %d/%d",
+        _active_downloads,
+        settings.max_concurrent_downloads,
+    )
+
+    session = DownloadSession(
+        source_url=source_url,
+        quality=quality,
+        concurrent_fragments=concurrent_fragments,
+        noplaylist=noplaylist,
+        max_filesize=max_file_size,
+        merge_output_format=merge_output_format,
+    )
+
+    cleanup_done = False
+    download_future: asyncio.Future | None = None
+
+    def release_and_cleanup() -> None:
+        global _active_downloads
+        nonlocal cleanup_done
+        if cleanup_done:
+            return
+        cleanup_done = True
+        try:
+            session.cleanup()
+        finally:
+            _semaphore.release()
+            _active_downloads = max(0, _active_downloads - 1)
+            logger.info(
+                "Active downloads: %d/%d",
+                _active_downloads,
+                settings.max_concurrent_downloads,
+            )
+
+    try:
+        # ---- metadata ----
+        try:
+            meta = await session.extract_metadata(timeout=metadata_timeout)
+        except MetadataExtractionError as exc:
+            raise HTTPException(
+                status_code=400, detail=f"Failed to extract video info: {exc}",
+            )
+
+        size_info = ""
+        if meta.estimated_size:
+            size_info = f", est={meta.estimated_size / 1_048_576:.1f}MB"
+        logger.info(
+            "Metadata: title='%s', uploader='%s', duration=%ss%s",
+            meta.title,
+            meta.uploader,
+            meta.duration,
+            size_info,
+        )
+
+        if meta.exceeds_size_limit(max_file_size):
+            raise FileSizeExceededError(
+                f"Estimated size ({meta.estimated_size / 1_048_576:.1f}MB) "
+                f"exceeds {max_file_size / 1_048_576:.1f}MB limit"
+            )
+
+        # ---- start background download ----
+        dl_future = session.start_download()
+        download_future = dl_future
+        dl_task = asyncio.create_task(
+            _monitor_download(dl_future, download_timeout),
+        )
+
+        # ---- wait for file to appear ----
+        expected = session.expected_output()
+        stream_path = await _wait_for_output(expected, dl_task, session)
+
+        # ---- build response ----
+        actual_ext = stream_path.suffix.lstrip(".").lower() or "mp4"
+        filename = _replace_ext(session.get_filename(), actual_ext)
+        ascii_name = (
+            filename.encode("ascii", "replace").decode("ascii").replace('"', "'")
+        )
+        disposition = (
+            f'attachment; filename="{ascii_name}"; '
+            f"filename*=UTF-8''{quote(filename, safe='')}"
+        )
+        mime = _media_type(actual_ext)
+
+        return StreamingResponse(
+            content=_stream_and_cleanup(
+                stream_path,
+                chunk_size,
+                dl_task,
+                dl_future,
+                release_and_cleanup,
+                max_file_size,
+            ),
+            media_type=mime,
+            headers={
+                "Content-Disposition": disposition,
+                "X-Filename": ascii_name,
+                "X-Filename-Encoded": quote(filename, safe=""),
+                "X-Content-Type": mime,
+            },
+        )
+
+    except DownloadTimeoutError as exc:
+        if settings.cleanup_on_error and download_future is not None:
+            asyncio.create_task(
+                _deferred_cleanup(download_future, release_and_cleanup, reason="request-timeout")
+            )
+        raise HTTPException(status_code=408, detail=str(exc))
+    except FileSizeExceededError as exc:
+        release_and_cleanup()
+        raise HTTPException(status_code=413, detail=str(exc))
+    except HTTPException:
+        if settings.cleanup_on_error:
+            if download_future is not None and not download_future.done():
+                asyncio.create_task(
+                    _deferred_cleanup(
+                        download_future, release_and_cleanup, reason="http-exception"
+                    )
+                )
+            else:
+                release_and_cleanup()
+        raise
+    except Exception as exc:
+        logger.exception("Unexpected error: %s", exc)
+        if settings.cleanup_on_error:
+            if download_future is not None and not download_future.done():
+                asyncio.create_task(
+                    _deferred_cleanup(
+                        download_future, release_and_cleanup, reason="unexpected-error"
+                    )
+                )
+            else:
+                release_and_cleanup()
+        raise HTTPException(
+            status_code=500, detail=f"Internal server error: {exc}",
+        )
+
+
+# ===================================================================
+# /health
+# ===================================================================
 
 
 @app.get("/health")
 async def health_check() -> dict:
-    """Health check endpoint with service status."""
     return {
         "status": "healthy",
         "service": "yt-dlp-streamer",
@@ -500,11 +579,17 @@ async def health_check() -> dict:
     }
 
 
+# ===================================================================
+# /debug/cookies
+# ===================================================================
+
+
 @app.get("/debug/cookies")
 async def debug_cookies() -> dict:
-    """Debug endpoint to check cookies file status and content."""
-    result = {
-        "cookies_file_configured": str(settings.cookies_file) if settings.cookies_file else None,
+    result: dict = {
+        "cookies_file_configured": (
+            str(settings.cookies_file) if settings.cookies_file else None
+        ),
         "cookies_file_exists": False,
         "cookies_file_size": 0,
         "total_domains": 0,
@@ -512,446 +597,208 @@ async def debug_cookies() -> dict:
         "vk_cookies_count": 0,
         "sample_vk_cookies": [],
     }
-    
+
     if not settings.cookies_file:
         return result
-    
     result["cookies_file_exists"] = settings.cookies_file.exists()
-    
     if not settings.cookies_file.exists():
         return result
-    
+
     result["cookies_file_size"] = settings.cookies_file.stat().st_size
-    
+
     try:
-        with open(settings.cookies_file, "r", encoding="utf-8") as f:
-            domains = set()
-            vk_cookies = []
+        with open(settings.cookies_file, encoding="utf-8") as f:
+            domains: set[str] = set()
+            vk_cookies: list[dict] = []
             for line in f:
                 line = line.strip()
                 if line and not line.startswith("#"):
                     parts = line.split("\t")
                     if len(parts) >= 7:
-                        domain = parts[0]
-                        cookie_name = parts[5]
+                        domain, cookie_name = parts[0], parts[5]
                         domains.add(domain)
-                        # Collect VK cookies info (without values for security)
                         if "vk" in domain.lower():
-                            vk_cookies.append({
-                                "domain": domain,
-                                "name": cookie_name,
-                                "path": parts[2],
-                            })
-            
+                            vk_cookies.append(
+                                {"domain": domain, "name": cookie_name, "path": parts[2]}
+                            )
             result["total_domains"] = len(domains)
             result["vk_cookies_count"] = len(vk_cookies)
-            result["sample_vk_cookies"] = vk_cookies[:20]  # First 20 VK cookies
-            
-            # Categorize video platform domains
+            result["sample_vk_cookies"] = vk_cookies[:20]
             result["video_platform_domains"] = {
-                "youtube": sorted([d for d in domains if "youtube" in d.lower()]),
-                "vk": sorted([d for d in domains if "vk" in d.lower()]),
-                "vimeo": sorted([d for d in domains if "vimeo" in d.lower()]),
-                "rutube": sorted([d for d in domains if "rutube" in d.lower()]),
+                p: sorted(d for d in domains if p in d.lower())
+                for p in ("youtube", "vk", "vimeo", "rutube")
             }
-    except Exception as e:
-        result["error"] = str(e)
-    
+    except Exception as exc:
+        result["error"] = str(exc)
+
     return result
+
+
+# ===================================================================
+# /download  (GET + POST)
+# ===================================================================
 
 
 @app.get("/download")
 async def download_video(
     source_url: Annotated[
-        str,
-        Query(
-            description="Video URL (YouTube, Vimeo, etc.)",
-            examples=["https://www.youtube.com/watch?v=dQw4w9WgXcQ"],
-        ),
+        str, Query(description="Video URL (YouTube, Vimeo, VK, etc.)"),
     ],
     quality: Annotated[
-        str,
-        Query(
-            description="Video quality: best, high (1080p), medium (720p), low (480p), audio",
-        ),
-    ] = "high",
-    noplaylist: Annotated[
-        bool,
-        Query(description="Download only the video, not the playlist"),
-    ] = True,
+        str, Query(description="best / high / medium / low / audio"),
+    ] = "best",
+    noplaylist: Annotated[bool, Query()] = True,
     concurrent_fragment_downloads: Annotated[
-        int,
-        Query(
-            ge=1,
-            le=16,
-            description="Number of concurrent fragment downloads",
-        ),
-    ] = 5,
-    merge_output_format: Annotated[
-        str,
-        Query(
-            description="Output container format",
-            pattern="^(mp4|mkv|webm|m4a|mp3)$",
-        ),
-    ] = "mp4",
+        int, Query(ge=1, le=16),
+    ] = settings.default_concurrent_fragments,
     chunk_size: Annotated[
-        int,
-        Query(
-            ge=1024,
-            le=10485760,  # 10MB max chunk
-            description="Streaming chunk size in bytes (default 1MB)",
-        ),
+        int, Query(ge=1024, le=10_485_760),
     ] = settings.stream_chunk_size,
     metadata_timeout: Annotated[
-        int,
-        Query(
-            ge=10,
-            le=300,
-            description="Metadata extraction timeout in seconds",
-        ),
+        int, Query(ge=10, le=300),
     ] = settings.metadata_timeout_seconds,
     download_timeout: Annotated[
-        int,
-        Query(
-            ge=30,
-            le=7200,
-            description="Download timeout in seconds",
-        ),
+        int, Query(ge=30, le=7200),
     ] = settings.download_timeout_seconds,
     max_file_size: Annotated[
-        int,
-        Query(
-            ge=1024 * 1024,  # 1MB minimum
-            le=10 * 1024 * 1024 * 1024,  # 10GB maximum
-            description="Maximum file size in bytes (default 1GB)",
-        ),
+        int, Query(ge=1_048_576, le=10_737_418_240),
     ] = settings.max_file_size_bytes,
 ) -> StreamingResponse:
-    """
-    Download and stream a video from the provided URL.
-
-    The video is downloaded to a temporary location, then streamed to the client.
-    After streaming completes, the temporary file is automatically deleted.
-
-    Returns:
-        StreamingResponse with video content and appropriate headers.
-
-    Raises:
-        HTTPException 400: Invalid URL or parameters.
-        HTTPException 408: Download timeout exceeded.
-        HTTPException 500: Download or streaming error.
-    """
-    global _active_downloads
-    
-    logger.info(f"Download request: {source_url} (quality={quality})")
-    
-    # Acquire semaphore to limit concurrent downloads
-    if _download_semaphore is None:
-        raise HTTPException(status_code=503, detail="Service not ready")
-
-    # Bound slot acquisition time so requests don't queue indefinitely.
-    try:
-        await asyncio.wait_for(
-            _download_semaphore.acquire(),
-            timeout=settings.download_slot_acquire_timeout_seconds,
-        )
-    except asyncio.TimeoutError:
-        raise HTTPException(
-            status_code=503,
-            detail=(
-                f"Server at capacity ({settings.max_concurrent_downloads} concurrent downloads). "
-                "Try again later."
-            ),
-        )
-
-    _active_downloads += 1
-    logger.info(f"Active downloads: {_active_downloads}/{settings.max_concurrent_downloads}")
-
-    # Create isolated download session (manual lifecycle to keep files during stream)
-    session = DownloadSession(
-        source_url=source_url,
-        quality=quality,
-        concurrent_fragments=concurrent_fragment_downloads,
-        merge_format=merge_output_format,
-        noplaylist=noplaylist,
-        max_filesize=max_file_size,
+    """Download and stream a video from the provided URL."""
+    return await _handle_download(
+        source_url,
+        quality,
+        noplaylist,
+        concurrent_fragment_downloads,
+        chunk_size,
+        metadata_timeout,
+        download_timeout,
+        max_file_size,
     )
-    
-    cleanup_done = False
-
-    def release_and_cleanup() -> None:
-        """Release semaphore and cleanup session."""
-        global _active_downloads
-        nonlocal cleanup_done
-
-        if cleanup_done:
-            logger.debug("Cleanup already completed for this session, skipping duplicate call")
-            return
-        cleanup_done = True
-
-        try:
-            session.cleanup()
-        finally:
-            _download_semaphore.release()
-            _active_downloads = max(0, _active_downloads - 1)
-            logger.info(f"Active downloads: {_active_downloads}/{settings.max_concurrent_downloads}")
-    
-    cleanup_fn = release_and_cleanup
-    
-    try:
-        # Extract metadata first to get proper filename
-        try:
-            metadata = await session.extract_metadata(timeout=metadata_timeout)
-            
-            # Format file size for logging
-            size_info = ""
-            if metadata.estimated_size:
-                size_mb = metadata.estimated_size / (1024 * 1024)
-                size_info = f", estimated_size={size_mb:.1f}MB"
-            
-            logger.info(
-                f"Video metadata: title='{metadata.title}', "
-                f"uploader='{metadata.uploader}', "
-                f"duration={metadata.duration}s{size_info}"
-            )
-            
-            # Early rejection if file size exceeds limit (when known from metadata)
-            if metadata.exceeds_size_limit(max_file_size):
-                estimated_mb = metadata.estimated_size / (1024 * 1024)
-                limit_mb = max_file_size / (1024 * 1024)
-                raise FileSizeExceededError(
-                    f"Video size ({estimated_mb:.1f}MB) exceeds limit ({limit_mb:.1f}MB)"
-                )
-                
-        except MetadataExtractionError as e:
-            logger.error(f"Metadata extraction failed: {e}")
-            raise HTTPException(
-                status_code=400,
-                detail=f"Failed to extract video info: {str(e)}",
-            )
-
-        # Start download in background and stream as it grows
-        download_future = session.start_download()
-        download_task = asyncio.create_task(
-            _monitor_download(download_future, download_timeout, cleanup_fn)
-        )
-
-        filename = session.get_filename().strip()
-        if not filename:
-            filename = f"download.{merge_output_format}"
-        logger.info(f"Download started: {filename}")
-
-        # Determine media type
-        media_type = _get_media_type(merge_output_format)
-
-        # Stream the file with cleanup callback after streaming completes
-        file_path = session.get_expected_output_path()
-
-        # HTTP headers must be ASCII/latin-1, so we need:
-        # - filename: ASCII fallback for older clients
-        # - filename*: UTF-8 encoded (RFC 5987) for modern clients
-        ascii_filename = filename.encode("ascii", "replace").decode("ascii")
-        ascii_filename = ascii_filename.replace('"', "'")  # Escape quotes
-        
-        content_disposition = (
-            f'attachment; filename="{ascii_filename}"; '
-            f"filename*=UTF-8''{quote(filename, safe='')}"
-        )
-
-        return StreamingResponse(
-            content=stream_file_while_downloading(
-                file_path, chunk_size, download_task, cleanup_fn, max_file_size,
-            ),
-            media_type=media_type,
-            headers={
-                "Content-Disposition": content_disposition,
-                "X-Filename": ascii_filename,
-                "X-Filename-Encoded": quote(filename, safe=""),  # UTF-8 URL-encoded
-                "X-Content-Type": media_type,  # Expose MIME type in custom header
-            },
-        )
-    except DownloadTimeoutError as e:
-        logger.error(f"Download timeout: {e}")
-        raise HTTPException(status_code=408, detail=str(e))
-    except FileSizeExceededError as e:
-        logger.warning(f"File size exceeded: {e}")
-        raise HTTPException(status_code=413, detail=str(e))
-    except HTTPException:
-        # Cleanup before re-raising HTTP exceptions
-        if settings.cleanup_on_error:
-            cleanup_fn()
-        raise
-    except Exception as e:
-        logger.exception(f"Unexpected error: {e}")
-        if settings.cleanup_on_error:
-            cleanup_fn()
-        raise HTTPException(
-            status_code=500,
-            detail=f"Internal server error: {str(e)}",
-        )
-
-
-def _get_media_type(format: str) -> str:
-    """Map format to MIME type."""
-    mime_types = {
-        "mp4": "video/mp4",
-        "mkv": "video/x-matroska",
-        "webm": "video/webm",
-        "m4a": "audio/mp4",
-        "mp3": "audio/mpeg",
-    }
-    return mime_types.get(format, "application/octet-stream")
-
-
-def _decode_url_if_needed(url: str) -> str:
-    """
-    Decode URL if it appears to be URL-encoded.
-    
-    Handles cases where URL was encoded before being added to JSON, e.g.:
-    - "https%3A%2F%2Fwww.youtube.com%2Fwatch%3Fv%3DdQw4w9WgXcQ"
-    - "https://www.youtube.com/watch?v=dQw4w9WgXcQ" (already decoded, returns as-is)
-    """
-    # Check if URL looks encoded (doesn't start with http:// or https://)
-    if url and not url.startswith(("http://", "https://")):
-        # Try to decode it
-        decoded = unquote(url)
-        if decoded.startswith(("http://", "https://")):
-            logger.debug(f"URL was encoded, decoded: {decoded[:100]}...")
-            return decoded
-    
-    # Also handle double-encoded or partially encoded URLs
-    # by checking for common encoded patterns
-    if "%3A" in url or "%2F" in url or "%3F" in url:
-        decoded = unquote(url)
-        logger.debug(f"URL contained encoded chars, decoded: {decoded[:100]}...")
-        return decoded
-    
-    return url
 
 
 @app.post("/download")
 async def download_video_post(request: DownloadRequest) -> StreamingResponse:
-    """
-    Download and stream a video from the provided URL (POST version).
-    
-    Accepts JSON body with URL and optional parameters.
-    Shares implementation with GET /download endpoint.
-    
-    The URL can be provided as-is or URL-encoded:
-    - "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
-    - "https%3A%2F%2Fwww.youtube.com%2Fwatch%3Fv%3DdQw4w9WgXcQ"
-    
-    Example request body:
-    ```json
-    {
-        "url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
-        "quality": "high",
-        "merge_output_format": "mp4"
-    }
-    ```
-    
-    Returns:
-        StreamingResponse with video content and appropriate headers.
-    """
-    # Decode URL if it was URL-encoded before being added to JSON
-    source_url = _decode_url_if_needed(request.url)
-    
-    # Delegate to the GET endpoint implementation with extracted parameters
-    return await download_video(
-        source_url=source_url,
-        quality=request.quality,
-        noplaylist=request.noplaylist,
-        concurrent_fragment_downloads=request.concurrent_fragment_downloads,
-        merge_output_format=request.merge_output_format,
-        chunk_size=request.chunk_size,
-        metadata_timeout=request.metadata_timeout,
-        download_timeout=request.download_timeout,
-        max_file_size=request.max_file_size,
+    """Download and stream a video (POST version with JSON body)."""
+    return await _handle_download(
+        _decode_url(request.url),
+        request.quality,
+        request.noplaylist,
+        request.concurrent_fragment_downloads,
+        request.chunk_size,
+        request.metadata_timeout,
+        request.download_timeout,
+        request.max_file_size,
     )
 
 
-def _guess_image_mime_type(content_type: str | None, url: str) -> tuple[str, str]:
-    """
-    Determine image MIME type and file extension from HTTP Content-Type or URL.
+# ===================================================================
+# /download-for-web  (GET + POST) — same pipeline, no transcoding
+# ===================================================================
 
-    Args:
-        content_type: Content-Type header value from the HTTP response.
-        url: The thumbnail URL (used as fallback for extension-based detection).
 
-    Returns:
-        Tuple of (mime_type, file_extension).
-    """
-    # Try Content-Type header first
-    if content_type:
-        ct = content_type.lower().split(";")[0].strip()
-        mime_map = {
-            "image/jpeg": ("image/jpeg", "jpg"),
-            "image/jpg": ("image/jpeg", "jpg"),
-            "image/png": ("image/png", "png"),
-            "image/webp": ("image/webp", "webp"),
-            "image/gif": ("image/gif", "gif"),
-            "image/bmp": ("image/bmp", "bmp"),
-            "image/svg+xml": ("image/svg+xml", "svg"),
-        }
-        if ct in mime_map:
-            return mime_map[ct]
+@app.get("/download-for-web")
+async def download_for_web(
+    source_url: Annotated[
+        str, Query(description="Video URL (YouTube, Vimeo, VK, etc.)"),
+    ],
+    quality: Annotated[
+        str, Query(description="best / high / medium / low / audio"),
+    ] = "best",
+    noplaylist: Annotated[bool, Query()] = True,
+    concurrent_fragment_downloads: Annotated[
+        int, Query(ge=1, le=16),
+    ] = settings.default_concurrent_fragments,
+    chunk_size: Annotated[
+        int, Query(ge=1024, le=10_485_760),
+    ] = settings.stream_chunk_size,
+    metadata_timeout: Annotated[
+        int, Query(ge=10, le=300),
+    ] = settings.metadata_timeout_seconds,
+    download_timeout: Annotated[
+        int, Query(ge=30, le=7200),
+    ] = settings.download_timeout_seconds,
+    max_file_size: Annotated[
+        int, Query(ge=1_048_576, le=10_737_418_240),
+    ] = settings.max_file_size_bytes,
+) -> StreamingResponse:
+    """Download and stream a video in a browser-compatible container."""
+    return await _handle_download(
+        source_url,
+        quality,
+        noplaylist,
+        concurrent_fragment_downloads,
+        chunk_size,
+        metadata_timeout,
+        download_timeout,
+        max_file_size,
+        merge_output_format="mp4",
+    )
 
-    # Fall back to URL extension
-    url_path = url.lower().split("?")[0]
-    ext_map = {
-        ".jpg": ("image/jpeg", "jpg"),
-        ".jpeg": ("image/jpeg", "jpg"),
-        ".png": ("image/png", "png"),
-        ".webp": ("image/webp", "webp"),
-        ".gif": ("image/gif", "gif"),
-    }
-    for ext, result in ext_map.items():
-        if url_path.endswith(ext):
-            return result
 
-    # Default to JPEG (most common for video thumbnails)
+@app.post("/download-for-web")
+async def download_for_web_post(
+    request: DownloadForWebRequest,
+) -> StreamingResponse:
+    """Download and stream a video for web in a browser-compatible container."""
+    return await _handle_download(
+        _decode_url(request.url),
+        request.quality,
+        request.noplaylist,
+        request.concurrent_fragment_downloads,
+        request.chunk_size,
+        request.metadata_timeout,
+        request.download_timeout,
+        request.max_file_size,
+        merge_output_format="mp4",
+    )
+
+
+# ===================================================================
+# /download/thumbnail  (GET + POST)
+# ===================================================================
+
+_IMG_MIME: dict[str, tuple[str, str]] = {
+    "image/jpeg": ("image/jpeg", "jpg"),
+    "image/jpg": ("image/jpeg", "jpg"),
+    "image/png": ("image/png", "png"),
+    "image/webp": ("image/webp", "webp"),
+    "image/gif": ("image/gif", "gif"),
+}
+
+_IMG_EXT: dict[str, tuple[str, str]] = {
+    ".jpg": ("image/jpeg", "jpg"),
+    ".jpeg": ("image/jpeg", "jpg"),
+    ".png": ("image/png", "png"),
+    ".webp": ("image/webp", "webp"),
+    ".gif": ("image/gif", "gif"),
+}
+
+
+def _guess_image_mime(ct: str | None, url: str) -> tuple[str, str]:
+    if ct:
+        key = ct.lower().split(";")[0].strip()
+        if key in _IMG_MIME:
+            return _IMG_MIME[key]
+    path = url.lower().split("?")[0]
+    for ext, val in _IMG_EXT.items():
+        if path.endswith(ext):
+            return val
     return ("image/jpeg", "jpg")
 
 
-async def _generate_thumbnail_from_stream(
+async def _ffmpeg_thumbnail(
     video_url: str,
     headers: dict[str, str] | None = None,
-    seek_seconds: int = 3,
+    seek: int = 3,
     timeout: float = 30.0,
 ) -> bytes:
-    """
-    Extract a single JPEG frame from a video stream URL using ffmpeg.
-
-    Only downloads enough data to decode one frame at the seek position —
-    does NOT download the entire video file.
-
-    Args:
-        video_url: Direct URL to the video stream.
-        headers: Optional HTTP headers (User-Agent, Cookie, etc.) for the request.
-        seek_seconds: Position to seek to before extracting the frame.
-        timeout: Maximum time to wait for ffmpeg to finish.
-
-    Returns:
-        JPEG image bytes.
-
-    Raises:
-        RuntimeError: If ffmpeg fails or produces no output.
-    """
-    cmd = [
-        "ffmpeg",
-        "-nostdin",
-        "-hide_banner",
-        "-loglevel", "error",
-    ]
-
-    # Pass HTTP headers to ffmpeg (User-Agent, Cookie, Referer, etc.)
+    """Extract a single JPEG frame from a video stream (no full download)."""
+    cmd: list[str] = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error"]
     if headers:
-        header_str = "".join(f"{k}: {v}\r\n" for k, v in headers.items())
-        cmd += ["-headers", header_str]
-
+        cmd += ["-headers", "".join(f"{k}: {v}\r\n" for k, v in headers.items())]
     cmd += [
-        # -ss before -i = fast seek (demuxer-level), minimal data downloaded
-        "-ss", str(seek_seconds),
+        "-ss", str(seek),
         "-i", video_url,
         "-frames:v", "1",
         "-vf", "scale='min(640,iw)':-2",
@@ -960,223 +807,120 @@ async def _generate_thumbnail_from_stream(
         "-q:v", "3",
         "pipe:1",
     ]
-
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-
     try:
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
     except asyncio.TimeoutError:
         proc.kill()
         await proc.wait()
-        raise RuntimeError(f"ffmpeg thumbnail extraction timed out ({timeout}s)")
-
-    if proc.returncode != 0 or not stdout:
-        error_msg = stderr.decode(errors="replace")[:500] if stderr else "unknown error"
-        raise RuntimeError(f"ffmpeg thumbnail extraction failed (rc={proc.returncode}): {error_msg}")
-
+        raise RuntimeError(f"ffmpeg thumbnail timed out ({timeout}s)")
+    if proc.returncode or not stdout:
+        err = stderr.decode(errors="replace")[:500] if stderr else "unknown"
+        raise RuntimeError(
+            f"ffmpeg thumbnail failed (rc={proc.returncode}): {err}"
+        )
     return stdout
 
 
 @app.get("/download/thumbnail")
 async def download_thumbnail(
     source_url: Annotated[
-        str,
-        Query(
-            description="Video URL (YouTube, Vimeo, etc.)",
-            examples=["https://www.youtube.com/watch?v=dQw4w9WgXcQ"],
-        ),
+        str, Query(description="Video URL (YouTube, Vimeo, VK, etc.)"),
     ],
     metadata_timeout: Annotated[
-        int,
-        Query(
-            ge=10,
-            le=300,
-            description="Metadata extraction timeout in seconds",
-        ),
+        int, Query(ge=10, le=300),
     ] = settings.metadata_timeout_seconds,
 ) -> Response:
     """
-    Extract and return the video thumbnail from the provided URL.
+    Return the video thumbnail.
 
-    Tries two strategies in order:
-    1. Platform-native thumbnail — downloads the thumbnail image URL provided
-       by YouTube, Facebook, VK, etc. (fast, no video data needed).
-    2. ffmpeg frame extraction — if no native thumbnail exists, extracts a
-       single frame from the lowest-quality video stream. Only downloads
-       enough bytes to decode one frame, NOT the entire video.
-
-    Returns:
-        Response with binary image content and appropriate headers.
-
-    Raises:
-        HTTPException 400: Invalid URL or metadata extraction failure.
-        HTTPException 404: No thumbnail could be obtained by any strategy.
-        HTTPException 502: Failed to download thumbnail from source platform.
+    Strategy 1: platform-native thumbnail URL (fast).
+    Strategy 2: extract a single frame via ffmpeg from the lowest-quality
+    video stream (only downloads enough bytes for one frame).
     """
-    logger.info(f"Thumbnail request: {source_url}")
-
-    # Create a lightweight session for metadata extraction only.
-    # No download directory is created — extract_metadata is network-only.
     session = DownloadSession(source_url=source_url)
-
     try:
-        # Extract metadata to get thumbnail URL + video stream URL
         try:
-            metadata = await session.extract_metadata(timeout=metadata_timeout)
-        except MetadataExtractionError as e:
-            logger.error(f"Metadata extraction failed for thumbnail: {e}")
+            meta = await session.extract_metadata(timeout=metadata_timeout)
+        except MetadataExtractionError as exc:
             raise HTTPException(
-                status_code=400,
-                detail=f"Failed to extract video info: {str(e)}",
+                status_code=400, detail=f"Failed to extract video info: {exc}",
             )
 
         image_bytes: bytes | None = None
-        mime_type: str = "image/jpeg"
-        ext: str = "jpg"
-        source: str = "unknown"
+        mime, ext, source = "image/jpeg", "jpg", "unknown"
 
-        # --- Strategy 1: Platform-native thumbnail URL ---
-        thumbnail_url = metadata.thumbnail
-        if thumbnail_url:
-            logger.info(
-                f"Trying platform thumbnail for '{metadata.title}': "
-                f"{thumbnail_url[:120]}..."
-            )
+        # Strategy 1 — platform thumbnail
+        if meta.thumbnail:
             try:
                 async with httpx.AsyncClient(
-                    follow_redirects=True,
-                    timeout=30.0,
+                    follow_redirects=True, timeout=30.0,
                 ) as client:
-                    resp = await client.get(thumbnail_url)
+                    resp = await client.get(meta.thumbnail)
                     resp.raise_for_status()
                     if resp.content:
                         image_bytes = resp.content
-                        content_type = resp.headers.get("content-type")
-                        mime_type, ext = _guess_image_mime_type(
-                            content_type, thumbnail_url
+                        mime, ext = _guess_image_mime(
+                            resp.headers.get("content-type"), meta.thumbnail,
                         )
                         source = "platform"
-                        logger.info(
-                            f"Platform thumbnail fetched: {len(image_bytes)} bytes, "
-                            f"type={mime_type}"
-                        )
-            except httpx.HTTPError as e:
-                logger.warning(
-                    f"Platform thumbnail download failed ({e}), "
-                    "falling back to ffmpeg extraction"
-                )
+            except httpx.HTTPError:
+                pass
 
-        # --- Strategy 2: Extract frame from video stream via ffmpeg ---
-        if not image_bytes and metadata.video_stream_url:
-            # Seek a few seconds in to skip black intro frames,
-            # but clamp to video duration if known
-            duration = metadata.duration or 60
-            seek = min(3, max(0, duration - 1))
-
-            logger.info(
-                f"Generating thumbnail via ffmpeg (seek={seek}s) from "
-                f"lowest-quality stream..."
-            )
+        # Strategy 2 — ffmpeg single-frame extraction
+        if not image_bytes and meta.video_stream_url:
+            dur = meta.duration or 60
+            seek = min(3, max(0, dur - 1))
             try:
-                image_bytes = await _generate_thumbnail_from_stream(
-                    video_url=metadata.video_stream_url,
-                    headers=metadata.video_stream_headers,
-                    seek_seconds=seek,
+                image_bytes = await _ffmpeg_thumbnail(
+                    meta.video_stream_url, meta.video_stream_headers, seek,
                 )
-                mime_type, ext = "image/jpeg", "jpg"
-                source = "ffmpeg"
-                logger.info(
-                    f"ffmpeg thumbnail generated: {len(image_bytes)} bytes"
-                )
-            except RuntimeError as e:
-                # If seeking failed (e.g., video shorter than seek), retry at 0
+                mime, ext, source = "image/jpeg", "jpg", "ffmpeg"
+            except RuntimeError:
                 if seek > 0:
-                    logger.warning(
-                        f"ffmpeg extraction at {seek}s failed ({e}), "
-                        "retrying at 0s..."
-                    )
                     try:
-                        image_bytes = await _generate_thumbnail_from_stream(
-                            video_url=metadata.video_stream_url,
-                            headers=metadata.video_stream_headers,
-                            seek_seconds=0,
+                        image_bytes = await _ffmpeg_thumbnail(
+                            meta.video_stream_url, meta.video_stream_headers, 0,
                         )
-                        mime_type, ext = "image/jpeg", "jpg"
-                        source = "ffmpeg"
-                        logger.info(
-                            f"ffmpeg thumbnail generated (0s): "
-                            f"{len(image_bytes)} bytes"
-                        )
-                    except RuntimeError as retry_err:
-                        logger.error(
-                            f"ffmpeg thumbnail retry also failed: {retry_err}"
-                        )
-                else:
-                    logger.error(f"ffmpeg thumbnail extraction failed: {e}")
+                        mime, ext, source = "image/jpeg", "jpg", "ffmpeg"
+                    except RuntimeError:
+                        pass
 
-        # --- No thumbnail obtained ---
         if not image_bytes:
             raise HTTPException(
-                status_code=404,
-                detail="No thumbnail could be obtained for this video",
+                status_code=404, detail="No thumbnail could be obtained",
             )
-
-        # Generate unique random filename
-        unique_name = f"{uuid.uuid4().hex}.{ext}"
-
-        # URL-encode the video title for safe header transport
-        safe_title = quote(metadata.safe_filename, safe="")
-
-        logger.info(
-            f"Returning thumbnail: {len(image_bytes)} bytes, source={source}, "
-            f"type={mime_type}, filename={unique_name}"
-        )
 
         return Response(
             content=image_bytes,
-            media_type=mime_type,
+            media_type=mime,
             headers={
-                "Content-Disposition": f'inline; filename="{unique_name}"',
+                "Content-Disposition": f'inline; filename="{uuid.uuid4().hex}.{ext}"',
                 "X-Thumbnail-Source": source,
-                # URL-encoded UTF-8 title (safe_filename is already capped at
-                # 200 UTF-8 bytes, so the encoded form fits HTTP header limits)
-                "X-Video-Title": safe_title,
+                "X-Video-Title": quote(meta.safe_filename, safe=""),
                 "Cache-Control": "public, max-age=86400",
             },
         )
     finally:
-        # Cleanup session (no-op if no download directory was created)
         session.cleanup()
 
 
 @app.post("/download/thumbnail")
 async def download_thumbnail_post(request: ThumbnailRequest) -> Response:
-    """
-    Extract and return the video thumbnail (POST version).
-
-    Accepts JSON body with URL and optional timeout.
-    Shares implementation with GET /download/thumbnail.
-
-    Example request body:
-    ```json
-    {
-        "url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
-    }
-    ```
-
-    Returns:
-        Response with binary image content and appropriate headers.
-    """
-    source_url = _decode_url_if_needed(request.url)
+    """Return video thumbnail (POST version with JSON body)."""
     return await download_thumbnail(
-        source_url=source_url,
+        source_url=_decode_url(request.url),
         metadata_timeout=request.metadata_timeout,
     )
 
+
+# ===================================================================
+# Entry point
+# ===================================================================
 
 if __name__ == "__main__":
     import uvicorn

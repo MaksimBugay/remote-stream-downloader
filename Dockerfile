@@ -27,7 +27,7 @@ FROM python:3.14.3-slim
 # Labels for container metadata
 LABEL org.opencontainers.image.title="yt-dlp Streaming Service" \
       org.opencontainers.image.description="FastAPI microservice for video downloads" \
-      org.opencontainers.image.version="1.0.0" \
+      org.opencontainers.image.version="2.0.0" \
       org.opencontainers.image.vendor="Custom" \
       maintainer="developer@example.com"
 
@@ -47,7 +47,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     HOST=0.0.0.0 \
     PORT=8000 \
     METADATA_TIMEOUT_SECONDS=300 \
-    DOWNLOAD_TIMEOUT_SECONDS=1800 \
+    DOWNLOAD_TIMEOUT_SECONDS=900 \
     STREAM_CHUNK_SIZE=1048576 \
     TEMP_DOWNLOAD_DIR=/tmp/yt-dlp-downloads \
     MAX_CONCURRENT_DOWNLOADS=10 \
@@ -56,9 +56,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /app
 
 # Install runtime dependencies
-# - ffmpeg: required for yt-dlp merging video/audio streams
-# - nodejs: required for yt-dlp YouTube extraction (JS runtime for signature decryption)
-# - curl/unzip: needed for deno installation
+# - ffmpeg: required by yt-dlp for muxing separate video+audio streams (no re-encoding)
+# - curl/unzip: needed for Deno installation
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     curl \

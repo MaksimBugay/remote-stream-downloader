@@ -1,6 +1,7 @@
 """Configuration settings for yt-dlp microservice."""
 
 from pathlib import Path
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -13,51 +14,42 @@ class Settings(BaseSettings):
         case_sensitive=False,
     )
 
-    # Server settings
+    # Server
     host: str = "0.0.0.0"
     port: int = 8000
 
-    # Download settings
-    metadata_timeout_seconds: int = 300  # 5 minutes max
-    download_timeout_seconds: int = 1800  # 30 minutes max
-    default_quality: str = "high"
-    default_concurrent_fragments: int = 5
-    default_merge_format: str = "mp4"
+    # Download
+    metadata_timeout_seconds: int = 300
+    download_timeout_seconds: int = 900
+    default_quality: str = "best"
+    default_concurrent_fragments: int = 8
 
-    # Streaming settings
-    stream_chunk_size: int = 1024 * 1024  # 1MB chunks by default
-    # Max time to wait for output file to appear before streaming can begin
-    # For videos with separate video+audio tracks, yt-dlp must download both
-    # and merge with ffmpeg before the output file exists
-    file_wait_timeout_seconds: int = 900  # 15 minutes (big files can take long to merge)
+    # Streaming
+    stream_chunk_size: int = 1024 * 1024
+    file_wait_timeout_seconds: int = 900
 
-    # Storage settings
+    # Storage
     temp_download_dir: Path = Path("/tmp/yt-dlp-downloads")
     cleanup_on_error: bool = True
-    
-    # Concurrency settings
-    max_concurrent_downloads: int = 10  # Prevent server overload
-    # Max time to wait for a download slot before returning 503
+
+    # Concurrency
+    max_concurrent_downloads: int = 10
     download_slot_acquire_timeout_seconds: float = 1.0
-    
-    # File size limits
-    max_file_size_bytes: int = 1024 * 1024 * 1024  # 1GB default limit
-    
+
+    # File size
+    max_file_size_bytes: int = 1024 * 1024 * 1024
+
     # Cookie file for general authentication (YouTube, etc.)
-    # Export cookies from browser using: yt-dlp --cookies-from-browser chrome --cookies cookies.txt
     cookies_file: Path | None = None
-    
+
     # Cookie file specifically for VK/VKVideo (vk.com, vkvideo.ru)
-    # VK often requires separate session cookies
     cookies_file_vk: Path | None = None
-    
-    # Proxy for yt-dlp (to bypass IP-based bot detection on servers)
-    # Format: http://user:pass@host:port or socks5://host:port
+
+    # Proxy for yt-dlp (to bypass IP-based bot detection)
     proxy: str | None = None
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        # Ensure temp directory exists
         self.temp_download_dir.mkdir(parents=True, exist_ok=True)
 
 

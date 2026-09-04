@@ -1,4 +1,4 @@
-"""yt-dlp download service with isolation and timeout support."""
+"""yt-dlp download session with per-request temp-folder isolation."""
 
 import asyncio
 import logging
@@ -6,10 +6,8 @@ import re
 import shutil
 import unicodedata
 import uuid
-from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import AsyncIterator, Optional
 
 import yt_dlp
 
@@ -17,148 +15,107 @@ from app.config import settings
 
 logger = logging.getLogger(__name__)
 
-# VK domain patterns
+# ---------------------------------------------------------------------------
+# VK cookie routing
+# ---------------------------------------------------------------------------
+
 VK_DOMAINS = ("vk.com", "vkvideo.ru", "vk.ru", "vk-video.ru")
 
 
 def _is_vk_url(url: str) -> bool:
-    """Check if URL is a VK/VKVideo URL."""
-    url_lower = url.lower()
-    return any(domain in url_lower for domain in VK_DOMAINS)
+    return any(d in url.lower() for d in VK_DOMAINS)
 
 
 def _get_cookies_source_file(url: str | None = None) -> tuple[Path | None, str]:
-    """
-    Select source cookies file and type for a URL.
-
-    Returns:
-        Tuple of (source_file_path, cookie_type_label).
-    """
-    use_vk_cookies = url and _is_vk_url(url) and settings.cookies_file_vk
-    if use_vk_cookies:
+    """Select the right cookies file (VK-specific vs general) for *url*."""
+    if url and _is_vk_url(url) and settings.cookies_file_vk:
         return settings.cookies_file_vk, "VK"
     return settings.cookies_file, "general"
 
 
-class DownloadError(Exception):
-    """Custom exception for download failures."""
+# ---------------------------------------------------------------------------
+# Exceptions
+# ---------------------------------------------------------------------------
 
+
+class DownloadError(Exception):
     pass
 
 
 class DownloadTimeoutError(DownloadError):
-    """Exception raised when download exceeds timeout."""
-
     pass
 
 
 class MetadataExtractionError(DownloadError):
-    """Exception raised when metadata extraction fails."""
-
     pass
 
 
 class FileSizeExceededError(DownloadError):
-    """Exception raised when file size exceeds the configured limit."""
-
     pass
+
+
+# ---------------------------------------------------------------------------
+# Metadata
+# ---------------------------------------------------------------------------
+
+_SKIP_EXTS = frozenset({".part", ".ytdl", ".tmp"})
+_DISK_STEM = "output"
 
 
 @dataclass
 class VideoMetadata:
-    """Video metadata extracted from source URL."""
+    """Video metadata extracted from the source URL."""
 
     title: str
     uploader: str | None
-    duration: int | None  # seconds
+    duration: int | None
     description: str | None
     thumbnail: str | None
     webpage_url: str
     extractor: str
     video_id: str
-    filesize: int | None  # bytes (exact if known)
-    filesize_approx: int | None  # bytes (approximate estimate)
-    # Direct URL to a low-quality video stream (for thumbnail generation via ffmpeg)
+    filesize: int | None
+    filesize_approx: int | None
     video_stream_url: str | None = None
-    # HTTP headers required to access the video stream URL (User-Agent, Cookie, etc.)
-    video_stream_headers: dict[str, str] | None = None
+    video_stream_headers: dict[str, str] | None = field(default=None, repr=False)
 
     @property
     def estimated_size(self) -> int | None:
-        """Get the best available file size estimate in bytes."""
         return self.filesize or self.filesize_approx
 
     def exceeds_size_limit(self, max_bytes: int) -> bool:
-        """Check if the estimated file size exceeds the given limit."""
-        size = self.estimated_size
-        return size is not None and size > max_bytes
+        est = self.estimated_size
+        return est is not None and est > max_bytes
 
     @property
     def safe_filename(self) -> str:
-        """
-        Generate a filesystem-safe filename from metadata.
-        
-        Preserves Unicode characters (Cyrillic, CJK, etc.) while removing
-        only characters that are problematic for filesystems.
-        """
-        # Start with title
-        name = (self.title or "").strip()
-
-        # Normalize unicode to NFC (composed form) - keeps characters intact
-        # Unlike NFKD which decomposes, NFC preserves the visual representation
-        name = unicodedata.normalize("NFC", name)
-
-        # Remove only filesystem-unsafe characters (Windows is most restrictive)
-        # < > : " / \ | ? * are not allowed in Windows filenames
+        name = unicodedata.normalize("NFC", (self.title or "").strip())
         name = re.sub(r'[<>:"/\\|?*]', "_", name)
-        
-        # Remove control characters (0x00-0x1F and 0x7F)
         name = re.sub(r"[\x00-\x1f\x7f]", "", name)
-        
-        # Remove leading/trailing dots and spaces (problematic on Windows)
         name = name.strip(". ")
-        
-        # Replace multiple consecutive spaces/underscores with single space
-        name = re.sub(r"[\s_]+", " ", name)
-        name = name.strip()
-
-        # Limit length in bytes (filesystem limits vary, 200 chars is safe)
-        # Use bytes limit for UTF-8 encoded names (some FS have byte limits)
-        max_bytes = 200
-        while len(name.encode("utf-8")) > max_bytes and len(name) > 1:
+        name = re.sub(r"[\s_]+", " ", name).strip()
+        while len(name.encode("utf-8")) > 200 and len(name) > 1:
             name = name[:-1].strip()
-
-        # Fallback if empty or only punctuation/whitespace
-        if not name or re.sub(r"[-_.\s]", "", name) == "":
-            fallback_id = self.video_id or "download"
-            name = f"video_{fallback_id}"
-
+        if not name or not re.sub(r"[-_.\s]", "", name):
+            name = f"video_{self.video_id or 'download'}"
         return name
 
-    def compose_filename(self, extension: str, include_uploader: bool = False) -> str:
-        """
-        Compose a complete filename with extension.
+    def compose_filename(self, ext: str) -> str:
+        return f"{self.safe_filename}.{ext}"
 
-        Args:
-            extension: File extension (without dot).
-            include_uploader: Whether to include uploader name in filename.
 
-        Returns:
-            Complete filename like "Video Title.mp4" or "Uploader - Video Title.mp4"
-        """
-        if include_uploader and self.uploader:
-            # Sanitize uploader name (same rules as title)
-            uploader_safe = unicodedata.normalize("NFC", self.uploader)
-            uploader_safe = re.sub(r'[<>:"/\\|?*\x00-\x1f\x7f]', "_", uploader_safe)
-            uploader_safe = uploader_safe.strip(". ")
-            return f"{uploader_safe} - {self.safe_filename}.{extension}"
-        return f"{self.safe_filename}.{extension}"
+# ---------------------------------------------------------------------------
+# Download session
+# ---------------------------------------------------------------------------
 
 
 class DownloadSession:
     """
-    Manages an isolated download session with its own temporary directory.
-    Ensures cleanup after use, even on errors.
+    One-request-one-folder download session.
+
+    Every call — even for the same URL — gets its own UUID-named temp
+    directory.  The folder is deleted only when ``cleanup()`` is called
+    (i.e. after the client has fully consumed the streamed file).
     """
 
     def __init__(
@@ -166,271 +123,218 @@ class DownloadSession:
         source_url: str,
         quality: str = settings.default_quality,
         concurrent_fragments: int = settings.default_concurrent_fragments,
-        merge_format: str = settings.default_merge_format,
         noplaylist: bool = True,
         max_filesize: int | None = None,
+        merge_output_format: str | None = None,
     ):
         self.source_url = source_url
         self.quality = quality
         self.concurrent_fragments = concurrent_fragments
-        self.merge_format = merge_format
         self.noplaylist = noplaylist
         self.max_filesize = max_filesize or settings.max_file_size_bytes
+        self.merge_output_format = merge_output_format
 
-        # Create unique session directory for isolation
-        self.session_id = str(uuid.uuid4())
+        self.session_id = uuid.uuid4().hex
         self.session_dir = settings.temp_download_dir / self.session_id
-        self.output_file: Path | None = None
         self.metadata: VideoMetadata | None = None
-        self._composed_filename: str | None = None
-        self._cookies_temp_path: Path | None = None
-        self._cookies_source_mtime: float | None = None
+        self._filename: str | None = None
+        self._cookies_path: Path | None = None
+        self._cookies_mtime: float | None = None
+        self._reported_output_path: Path | None = None
 
-    def _get_writable_cookies_path(self) -> Path | None:
-        """
-        Get a per-session writable cookies copy for yt-dlp.
+    # -------------------------------------------------------------- cookies
 
-        The source cookies file is shared/read-only, but each download session
-        gets its own writable copy in the unique session directory to avoid
-        cross-request races when yt-dlp updates cookies.
-        """
-        source_file, cookie_type = _get_cookies_source_file(self.source_url)
-        if not source_file:
-            logger.debug(f"No {cookie_type} cookies file configured")
+    def _writable_cookies(self) -> Path | None:
+        """Return a per-session writable copy of the correct cookies file."""
+        source, label = _get_cookies_source_file(self.source_url)
+        if not source:
             return None
-        if not source_file.exists():
-            logger.warning(f"{cookie_type} cookies file not found: {source_file}")
-            if cookie_type == "VK" and settings.cookies_file and settings.cookies_file.exists():
-                logger.info("Falling back to general cookies file for VK URL")
-                source_file = settings.cookies_file
-                cookie_type = "general"
+        if not source.exists():
+            if (
+                label == "VK"
+                and settings.cookies_file
+                and settings.cookies_file.exists()
+            ):
+                logger.info("VK cookies missing — falling back to general cookies")
+                source = settings.cookies_file
+                label = "general"
             else:
+                logger.warning("%s cookies not found: %s", label, source)
                 return None
 
-        source_stat = source_file.stat()
-        source_mtime = source_stat.st_mtime
-        cookie_size = source_stat.st_size
-
-        if self._cookies_temp_path and self._cookies_temp_path.exists():
-            if self._cookies_source_mtime is not None and source_mtime <= self._cookies_source_mtime:
-                return self._cookies_temp_path
+        mtime = source.stat().st_mtime
+        if (
+            self._cookies_path
+            and self._cookies_path.exists()
+            and self._cookies_mtime is not None
+            and mtime <= self._cookies_mtime
+        ):
+            return self._cookies_path
 
         self.session_dir.mkdir(parents=True, exist_ok=True)
-        target_name = "cookies-vk.txt" if cookie_type == "VK" else "cookies.txt"
-        target_path = self.session_dir / target_name
-
+        dst = self.session_dir / f"cookies-{label.lower()}.txt"
         try:
-            shutil.copy2(source_file, target_path)
-            self._cookies_temp_path = target_path
-            self._cookies_source_mtime = source_mtime
+            shutil.copy2(source, dst)
+            self._cookies_path = dst
+            self._cookies_mtime = mtime
             logger.info(
-                "Copied %s cookies to session location: %s (%d bytes)",
-                cookie_type,
-                target_path,
-                cookie_size,
+                "Copied %s cookies (%d B) → %s",
+                label,
+                source.stat().st_size,
+                dst,
             )
-            return target_path
-        except Exception as e:
-            logger.error(f"Failed to copy {cookie_type} cookies file: {e}")
+            return dst
+        except Exception as exc:
+            logger.error("Failed to copy %s cookies: %s", label, exc)
             return None
 
-    def _get_extract_opts(self) -> dict:
-        """Build yt-dlp options for metadata extraction only."""
-        opts = {
+    # --------------------------------------------------------- yt-dlp opts
+
+    def _common_opts(self) -> dict:
+        opts: dict = {
             "quiet": True,
             "no_warnings": True,
-            "extract_flat": False,
             "noplaylist": self.noplaylist,
-            "skip_download": True,
-            # Don't require specific format during metadata extraction
-            "format": None,
-            # Ignore errors about unavailable formats during extraction
-            "ignore_no_formats_error": True,
-            # Enable remote components for YouTube JS challenge solving
-            # Required for signature decryption on newer YouTube videos
+            "extract_flat": False,
             "remote_components": ["ejs:github"],
+        }
+        cookies = self._writable_cookies()
+        if cookies:
+            opts["cookiefile"] = str(cookies)
+        if settings.proxy:
+            opts["proxy"] = settings.proxy
+        return opts
+
+    def _extract_opts(self) -> dict:
+        opts = self._common_opts()
+        opts |= {
+            "skip_download": True,
+            "format": None,
+            "ignore_no_formats_error": True,
             "allow_unplayable_formats": False,
         }
-        # Add cookies if configured - use URL-specific cookies (VK vs general)
-        cookies_path = self._get_writable_cookies_path()
-        if cookies_path:
-            opts["cookiefile"] = str(cookies_path)
-            cookie_type = "VK" if _is_vk_url(self.source_url) else "general"
-            logger.info(f"Using {cookie_type} cookies for metadata extraction: {cookies_path}")
-        else:
-            logger.warning("No cookies file available for metadata extraction")
-        # Add proxy if configured (for server IP reputation issues)
-        if settings.proxy:
-            opts["proxy"] = settings.proxy
-            logger.info(f"Using proxy: {settings.proxy}")
         return opts
 
-    # Fixed disk filename for yt-dlp output (no Unicode — avoids all encoding
-    # and sanitization mismatches).  The *real* user-facing filename with full
-    # Unicode support (Russian, CJK, etc.) is set only in HTTP response headers
-    # via get_filename() / compose_filename().
-    _DISK_FILENAME_STEM = "output"
+    @staticmethod
+    def _format_selector(quality: str) -> str:
+        """Permissive format selector — no container/codec restrictions.
 
-    def _get_ydl_opts(self) -> dict:
-        """Build yt-dlp options dictionary for download."""
-        format_selector = self._get_format_selector()
-
-        # Use a fixed ASCII filename on disk — the human-readable Unicode name
-        # is only used in HTTP response headers, not on the filesystem
-        output_template = str(self.session_dir / f"{self._DISK_FILENAME_STEM}.%(ext)s")
-
-        opts = {
-            "format": format_selector,
-            "outtmpl": output_template,
-            "noplaylist": self.noplaylist,
-            "concurrent_fragment_downloads": self.concurrent_fragments,
-            "merge_output_format": self.merge_format,
-            "nopart": True,
-            "quiet": True,
-            "no_warnings": True,
-            "extract_flat": False,
-            "writeinfojson": False,
-            "writethumbnail": False,
-            # Enable remote components for YouTube JS challenge solving
-            # Must be a list of allowed remote component sources
-            "remote_components": ["ejs:github"],
-            # No postprocessors - merge_output_format handles container format
-            # during download, enabling true streaming-while-downloading
-        }
-        
-        # Add cookies if configured - use URL-specific cookies (VK vs general)
-        cookies_path = self._get_writable_cookies_path()
-        if cookies_path:
-            opts["cookiefile"] = str(cookies_path)
-            cookie_type = "VK" if _is_vk_url(self.source_url) else "general"
-            logger.debug(f"Using {cookie_type} cookies for download: {cookies_path}")
-        
-        # Add proxy if configured (for server IP reputation issues)
-        if settings.proxy:
-            opts["proxy"] = settings.proxy
-            logger.debug(f"Using proxy for download: {settings.proxy}")
-        
-        # Add file size limit if configured
-        if self.max_filesize:
-            opts["max_filesize"] = self.max_filesize
-        
-        return opts
-
-    def _get_format_selector(self) -> str:
-        """Map quality setting to yt-dlp format selector with flexible fallbacks."""
-        # Format selection strategy:
-        # 1. Try preferred mp4/m4a combination (most compatible)
-        # 2. Fall back to any video+audio with height constraint
-        # 3. Fall back to any video+audio (yt-dlp will merge)
-        # 4. Fall back to best single format with container preference
-        # 5. Ultimate fallback to literally anything available
-        quality_map = {
-            "best": (
-                "bestvideo[ext=mp4]+bestaudio[ext=m4a]/"
-                "bestvideo[ext=mp4]+bestaudio/"
-                "bestvideo+bestaudio[ext=m4a]/"
-                "bestvideo+bestaudio/"
-                "best[ext=mp4]/best[ext=webm]/best"
-            ),
+        Uses ``bv*`` (best video, may include audio) + ``ba`` (best audio)
+        so yt-dlp can always find a valid combination even when separate
+        video-only / audio-only streams are not available.
+        """
+        table = {
+            "best": "bv*+ba/b",
             "high": (
-                "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/"
-                "bestvideo[height<=1080][ext=mp4]+bestaudio/"
-                "bestvideo[height<=1080]+bestaudio/"
-                "bestvideo+bestaudio/"
-                "best[height<=1080][ext=mp4]/best[height<=1080]/best"
+                "bv*[height<=1080]+ba/"
+                "b[height<=1080]/"
+                "bv*+ba/b"
             ),
             "medium": (
-                "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/"
-                "bestvideo[height<=720][ext=mp4]+bestaudio/"
-                "bestvideo[height<=720]+bestaudio/"
-                "bestvideo+bestaudio/"
-                "best[height<=720][ext=mp4]/best[height<=720]/best"
+                "bv*[height<=720]+ba/"
+                "b[height<=720]/"
+                "bv*+ba/b"
             ),
             "low": (
-                "bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/"
-                "bestvideo[height<=480][ext=mp4]+bestaudio/"
-                "bestvideo[height<=480]+bestaudio/"
-                "bestvideo+bestaudio/"
-                "best[height<=480][ext=mp4]/best[height<=480]/best"
+                "bv*[height<=480]+ba/"
+                "b[height<=480]/"
+                "bv*+ba/b"
             ),
-            "audio": "bestaudio[ext=m4a]/bestaudio[ext=mp3]/bestaudio/best",
+            "audio": "ba/b",
         }
-        return quality_map.get(self.quality, quality_map["best"])
+        return table.get(quality, table["best"])
 
-    async def extract_metadata(
-        self, timeout: Optional[int] = None
-    ) -> VideoMetadata:
+    def _download_opts(self) -> dict:
+        self.session_dir.mkdir(parents=True, exist_ok=True)
+        opts = self._common_opts()
+        opts |= {
+            "format": self._format_selector(self.quality),
+            "outtmpl": str(self.session_dir / f"{_DISK_STEM}.%(ext)s"),
+            "concurrent_fragment_downloads": self.concurrent_fragments,
+            "nopart": True,
+            "writeinfojson": False,
+            "writethumbnail": False,
+            "progress_hooks": [self._progress_hook],
+            "postprocessor_hooks": [self._postprocessor_hook],
+        }
+        if self.max_filesize:
+            opts["max_filesize"] = self.max_filesize
+        if self.merge_output_format:
+            opts["merge_output_format"] = self.merge_output_format
+        return opts
+
+    def _progress_hook(self, data: dict) -> None:
+        """Capture output path from yt-dlp progress events.
+
+        Only accepts paths whose stem matches ``_DISK_STEM`` exactly so that
+        intermediate per-format files (e.g. ``output.f137.mp4``) produced
+        during bestvideo+bestaudio downloads are ignored.
         """
-        Extract video metadata without downloading.
+        status = data.get("status")
+        if status not in {"downloading", "finished"}:
+            return
+        info = data.get("info_dict") or {}
+        candidate = info.get("filepath") or data.get("filename")
+        if not candidate:
+            return
+        try:
+            path = Path(candidate)
+            if not path.is_absolute():
+                path = self.session_dir / path
+            if path.stem == _DISK_STEM:
+                self._reported_output_path = path
+        except Exception:
+            return
 
-        Returns:
-            VideoMetadata object with video information.
+    def _postprocessor_hook(self, data: dict) -> None:
+        """Capture final output path after postprocessors (e.g. ffmpeg merge)."""
+        if data.get("status") != "finished":
+            return
+        info = data.get("info_dict") or {}
+        filepath = info.get("filepath")
+        if not filepath:
+            return
+        try:
+            path = Path(filepath)
+            if not path.is_absolute():
+                path = self.session_dir / path
+            self._reported_output_path = path
+        except Exception:
+            return
 
-        Raises:
-            MetadataExtractionError: If extraction fails.
-        """
-        opts = self._get_extract_opts()
+    # ------------------------------------------------------------- metadata
 
+    async def extract_metadata(self, timeout: int | None = None) -> VideoMetadata:
+        opts = self._extract_opts()
         try:
             loop = asyncio.get_running_loop()
-            extract_task = loop.run_in_executor(None, self._sync_extract_info, opts)
-            if timeout:
-                info = await asyncio.wait_for(extract_task, timeout=timeout)
-            else:
-                info = await extract_task
-        except asyncio.TimeoutError as e:
+            fut = loop.run_in_executor(None, self._do_extract, opts)
+            info = await (asyncio.wait_for(fut, timeout=timeout) if timeout else fut)
+        except asyncio.TimeoutError:
             raise MetadataExtractionError(
-                f"Metadata extraction exceeded {timeout}s timeout"
-            ) from e
-        except Exception as e:
-            raise MetadataExtractionError(f"Failed to extract metadata: {e}") from e
+                f"Metadata extraction timed out ({timeout}s)"
+            )
+        except MetadataExtractionError:
+            raise
+        except Exception as exc:
+            raise MetadataExtractionError(str(exc)) from exc
 
         if not info:
-            raise MetadataExtractionError("No metadata returned from extraction")
+            raise MetadataExtractionError("No metadata returned")
 
-        # Extract filesize - check multiple possible fields
-        # yt-dlp provides filesize for direct downloads, filesize_approx for estimated
         filesize = info.get("filesize")
         filesize_approx = info.get("filesize_approx")
-        
-        # For format selection, check requested_formats for combined size
         if not filesize and not filesize_approx:
-            requested_formats = info.get("requested_formats", [])
-            if requested_formats:
-                total_size = sum(
-                    f.get("filesize") or f.get("filesize_approx") or 0
-                    for f in requested_formats
-                )
-                if total_size > 0:
-                    filesize_approx = total_size
-        
-        # Find the lowest-quality video stream URL for thumbnail generation.
-        # Prefer direct HTTP(S) formats with video codec, sorted by resolution
-        # ascending so we download minimal data if ffmpeg extraction is needed.
-        video_stream_url = None
-        video_stream_headers = None
-        formats = info.get("formats") or []
-        video_formats = [
-            f for f in formats
-            if f.get("vcodec") and f.get("vcodec") != "none" and f.get("url")
-        ]
-        if video_formats:
-            # Sort: prefer direct HTTP(S) protocols, then by lowest height
-            def _thumb_sort_key(f: dict) -> tuple[int, int]:
-                protocol = f.get("protocol", "")
-                is_direct = 0 if protocol in ("https", "http", "") else 1
-                height = f.get("height") or 9999
-                return (is_direct, height)
+            total = sum(
+                f.get("filesize") or f.get("filesize_approx") or 0
+                for f in info.get("requested_formats", [])
+            )
+            if total:
+                filesize_approx = total
 
-            video_formats.sort(key=_thumb_sort_key)
-            best = video_formats[0]
-            video_stream_url = best.get("url")
-            video_stream_headers = best.get("http_headers")
-        elif info.get("url"):
-            # Single-format video: use its URL directly
-            video_stream_url = info.get("url")
-            video_stream_headers = info.get("http_headers")
+        vs_url, vs_hdrs = self._pick_thumbnail_stream(info)
 
+        ext = info.get("ext") or "mp4"
         self.metadata = VideoMetadata(
             title=info.get("title", "Unknown Title"),
             uploader=info.get("uploader") or info.get("channel"),
@@ -442,185 +346,104 @@ class DownloadSession:
             video_id=info.get("id", self.session_id),
             filesize=filesize,
             filesize_approx=filesize_approx,
-            video_stream_url=video_stream_url,
-            video_stream_headers=video_stream_headers,
+            video_stream_url=vs_url,
+            video_stream_headers=vs_hdrs,
         )
-
-        # Pre-compose the filename
-        self._composed_filename = self.metadata.compose_filename(self.merge_format)
-
+        self._filename = self.metadata.compose_filename(ext)
         return self.metadata
 
-    def _sync_extract_info(self, opts: dict) -> dict:
-        """Synchronously extract video info."""
-        # Log the options being used (without sensitive data)
-        safe_opts = {k: v for k, v in opts.items() if k != "cookiefile"}
-        if "cookiefile" in opts:
-            safe_opts["cookiefile"] = f"{opts['cookiefile']} (exists: {Path(opts['cookiefile']).exists()})"
-        logger.debug(f"yt-dlp extract options: {safe_opts}")
-        
+    @staticmethod
+    def _pick_thumbnail_stream(info: dict) -> tuple[str | None, dict | None]:
+        """Pick the lowest-quality video stream URL for thumbnail extraction."""
+        vfmts = [
+            f
+            for f in (info.get("formats") or [])
+            if f.get("vcodec") and f["vcodec"] != "none" and f.get("url")
+        ]
+        if vfmts:
+            vfmts.sort(
+                key=lambda f: (
+                    0 if f.get("protocol", "") in ("https", "http", "") else 1,
+                    f.get("height") or 9999,
+                ),
+            )
+            return vfmts[0].get("url"), vfmts[0].get("http_headers")
+        if info.get("url"):
+            return info["url"], info.get("http_headers")
+        return None, None
+
+    def _do_extract(self, opts: dict) -> dict:
         with yt_dlp.YoutubeDL(opts) as ydl:
             return ydl.extract_info(self.source_url, download=False)
 
-    async def download(self, timeout: int = settings.download_timeout_seconds) -> Path:
-        """
-        Execute the download with timeout.
-
-        If metadata hasn't been extracted yet, it will be extracted first.
-
-        Args:
-            timeout: Maximum seconds to wait for download completion.
-
-        Returns:
-            Path to the downloaded file.
-
-        Raises:
-            DownloadTimeoutError: If download exceeds timeout.
-            DownloadError: If download fails for any other reason.
-        """
-        # Extract metadata first if not already done
-        if self.metadata is None:
-            await self.extract_metadata(timeout=timeout)
-
-        # Ensure session directory exists
-        self.session_dir.mkdir(parents=True, exist_ok=True)
-
-        opts = self._get_ydl_opts()
-
-        try:
-            loop = asyncio.get_running_loop()
-            await asyncio.wait_for(
-                loop.run_in_executor(None, self._sync_download, opts),
-                timeout=timeout,
-            )
-        except asyncio.TimeoutError as e:
-            raise DownloadTimeoutError(
-                f"Download exceeded {timeout}s timeout"
-            ) from e
-
-        # Find the output file
-        self.output_file = self._find_output_file()
-        if not self.output_file:
-            raise DownloadError("Download completed but output file not found")
-
-        return self.output_file
+    # -------------------------------------------------------------- download
 
     def start_download(self) -> asyncio.Future:
-        """
-        Start the download in a background executor and return the future.
+        """Kick off the download in a background executor thread."""
+        opts = self._download_opts()
+        return asyncio.get_running_loop().run_in_executor(
+            None, self._do_download, opts
+        )
 
-        Returns:
-            asyncio.Future that resolves when download completes or fails.
-        """
-        # Ensure session directory exists
-        self.session_dir.mkdir(parents=True, exist_ok=True)
-        opts = self._get_ydl_opts()
-        loop = asyncio.get_running_loop()
-        return loop.run_in_executor(None, self._sync_download, opts)
-
-    def _sync_download(self, opts: dict) -> None:
-        """Synchronous download using yt-dlp."""
+    def _do_download(self, opts: dict) -> None:
         with yt_dlp.YoutubeDL(opts) as ydl:
-            error_code = ydl.download([self.source_url])
-            if error_code != 0:
-                raise DownloadError(f"yt-dlp returned error code: {error_code}")
+            rc = ydl.download([self.source_url])
+            if rc:
+                raise DownloadError(f"yt-dlp error code {rc}")
 
-    def _find_output_file(self) -> Path | None:
-        """Find the downloaded file in session directory."""
+    # -------------------------------------------------------- output helpers
+
+    def expected_output(self) -> Path:
+        """Best-guess output path (actual extension may differ)."""
+        ext = "mp4"
+        if self._filename:
+            ext = self._filename.rsplit(".", 1)[-1]
+        return self.session_dir / f"{_DISK_STEM}.{ext}"
+
+    def resolve_output(self) -> Path | None:
+        """Find the actual output file produced by yt-dlp (cheap checks only).
+
+        Filters out intermediate per-format files (stem != ``_DISK_STEM``) so
+        that bestvideo+bestaudio downloads don't prematurely stream the
+        video-only fragment before the ffmpeg merge completes.
+        """
         if not self.session_dir.exists():
             return None
-
-        # Look for video files with expected extensions
-        extensions = [self.merge_format, "mp4", "mkv", "webm", "m4a", "mp3"]
-        for ext in extensions:
-            files = list(self.session_dir.glob(f"*.{ext}"))
-            if files:
-                # Return the largest file (in case of temp files)
-                return max(files, key=lambda f: f.stat().st_size)
-
-        # Fallback: return any file
-        files = list(self.session_dir.iterdir())
-        if files:
-            return files[0]
-
+        if self._reported_output_path and self._reported_output_path.exists():
+            return self._reported_output_path
+        matches = [
+            p
+            for p in self.session_dir.glob(f"{_DISK_STEM}.*")
+            if p.is_file()
+            and p.suffix.lower() not in _SKIP_EXTS
+            and p.stem == _DISK_STEM
+        ]
+        if matches:
+            return max(matches, key=lambda p: p.stat().st_size)
         return None
 
-    def get_file_size(self) -> int:
-        """Get the size of the output file in bytes."""
-        if self.output_file and self.output_file.exists():
-            return self.output_file.stat().st_size
-        return 0
-
-    def get_expected_output_path(self) -> Path:
-        """
-        Get the expected output file path for streaming.
-        
-        Returns the deterministic disk path (output.<ext>) where yt-dlp writes
-        the merged file.  The human-readable Unicode filename is only used in
-        HTTP response headers, not on the filesystem.
-        """
-        return self.session_dir / f"{self._DISK_FILENAME_STEM}.{self.merge_format}"
+    def resolve_output_recursive(self) -> Path | None:
+        """Slow fallback used only once after download has completed."""
+        if not self.session_dir.exists():
+            return None
+        direct = self.resolve_output()
+        if direct:
+            return direct
+        candidates = [
+            p
+            for p in self.session_dir.rglob("*")
+            if p.is_file() and p.suffix.lower() not in _SKIP_EXTS
+        ]
+        return max(candidates, key=lambda p: p.stat().st_size) if candidates else None
 
     def get_filename(self) -> str:
-        """
-        Get the user-facing filename for HTTP response headers.
+        """User-facing filename (Unicode-safe, for HTTP headers only)."""
+        return self._filename or "download.mp4"
 
-        Returns a Unicode-safe filename from metadata (supports Russian, CJK,
-        etc.).  This name is NOT used on disk — only in Content-Disposition and
-        X-Filename headers.
-        """
-        if self._composed_filename:
-            return self._sanitize_filename(self._composed_filename)
-
-        return f"download.{self.merge_format}"
-
-    def _sanitize_filename(self, filename: str) -> str:
-        """Normalize edge-case filenames like '-' or empty values."""
-        name = (filename or "").strip()
-        if not name:
-            return f"download.{self.merge_format}"
-        stem, dot, ext = name.rpartition(".")
-        base = stem if dot else name
-        if re.sub(r"[-_.\s]", "", base) == "":
-            return f"download.{self.merge_format}"
-        return name
+    # --------------------------------------------------------------- cleanup
 
     def cleanup(self) -> None:
-        """Remove session directory and all contents."""
+        """Remove the session temp folder and all its contents."""
         if self.session_dir.exists():
             shutil.rmtree(self.session_dir, ignore_errors=True)
-
-
-@asynccontextmanager
-async def create_download_session(
-    source_url: str,
-    quality: str = settings.default_quality,
-    concurrent_fragments: int = settings.default_concurrent_fragments,
-    merge_format: str = settings.default_merge_format,
-    noplaylist: bool = True,
-    max_filesize: int | None = None,
-) -> AsyncIterator[DownloadSession]:
-    """
-    Context manager for download sessions with automatic cleanup.
-
-    Usage:
-        async with create_download_session(url) as session:
-            metadata = await session.extract_metadata()
-            print(f"Downloading: {metadata.title}")
-            await session.download()
-            # Stream file...
-        # Cleanup happens automatically
-    """
-    session = DownloadSession(
-        source_url=source_url,
-        quality=quality,
-        concurrent_fragments=concurrent_fragments,
-        merge_format=merge_format,
-        noplaylist=noplaylist,
-        max_filesize=max_filesize,
-    )
-    try:
-        yield session
-    finally:
-        # Always cleanup, even on errors
-        session.cleanup()
+            logger.debug("Removed session dir %s", self.session_dir)
