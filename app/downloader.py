@@ -63,6 +63,36 @@ def _get_cookies_source_file(url: str | None = None) -> tuple[Path | None, str]:
     return settings.cookies_file, "general"
 
 
+def _alias_vk_ru_cookies(path: Path) -> int:
+    """Also offer vk.ru cookies to vk.com in the Netscape cookie file *path*.
+
+    yt-dlp's VK extractor always calls https://vk.com/al_video.php, whatever
+    the link's domain, but browsers now keep the VK login on vk.ru.  Without
+    the session VK answers e.g. "Video only available to followers".  Cookies
+    the file already has for vk.com are kept.  Returns the number added.
+    """
+    lines = path.read_text(encoding="utf-8").splitlines()
+    rows = [line.split("\t") for line in lines]
+
+    def is_cookie(r: list[str]) -> bool:
+        return len(r) >= 7 and (not r[0].startswith("#") or r[0].startswith("#HttpOnly_"))
+
+    def bare_domain(r: list[str]) -> str:
+        return r[0].removeprefix("#HttpOnly_").lstrip(".")
+
+    existing = {(bare_domain(r), r[2], r[5]) for r in rows if is_cookie(r)}
+    added = []
+    for r in rows:
+        if not is_cookie(r) or bare_domain(r) != "vk.ru":
+            continue
+        if ("vk.com", r[2], r[5]) in existing:
+            continue
+        added.append("\t".join([r[0].replace("vk.ru", "vk.com"), *r[1:]]))
+    if added:
+        path.write_text("\n".join(lines + added) + "\n", encoding="utf-8")
+    return len(added)
+
+
 # ---------------------------------------------------------------------------
 # Exceptions
 # ---------------------------------------------------------------------------
@@ -325,10 +355,17 @@ class DownloadSession:
                 source.stat().st_size,
                 dst,
             )
-            return dst
         except Exception as exc:
             logger.error("Failed to copy %s cookies: %s", label, exc)
             return None
+        if _is_vk_url(self.source_url):
+            try:
+                aliased = _alias_vk_ru_cookies(dst)
+                if aliased:
+                    logger.info("Offered %d vk.ru cookies to vk.com", aliased)
+            except Exception as exc:
+                logger.warning("Could not alias vk.ru cookies: %s", exc)
+        return dst
 
     # --------------------------------------------------------- yt-dlp opts
 

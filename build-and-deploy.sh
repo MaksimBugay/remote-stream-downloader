@@ -9,8 +9,8 @@ docker buildx build \
   --platform linux/amd64,linux/arm64 \
   -t yt-dlp-streamer:latest .
 
-#docker tag yt-dlp-streamer:latest n7fr846yfa6ohlhe/mbugai:remote-stream-downloader-39
-#docker push n7fr846yfa6ohlhe/mbugai:remote-stream-downloader-39
+#docker tag yt-dlp-streamer:latest n7fr846yfa6ohlhe/mbugai:remote-stream-downloader-40
+#docker push n7fr846yfa6ohlhe/mbugai:remote-stream-downloader-40
 
 docker compose up -d
 docker logs -f yt-dlp-streamer
