@@ -1,8 +1,8 @@
-fastapi>=0.135.1
-uvicorn[standard]>=0.42.0
-yt-dlp==2026.8.19
-python-multipart>=0.0.22
-pydantic>=2.12.5
-pydantic-settings>=2.13.1
+fastapi>=0.162.0
+uvicorn[standard]>=0.54.0
+yt-dlp==2026.10.26
+python-multipart>=0.0.33
+pydantic>=2.14.3
+pydantic-settings>=2.16.2
 aiofiles>=25.1.0
 httpx>=0.28.1

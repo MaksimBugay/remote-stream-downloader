@@ -12,10 +12,10 @@ import asyncio
 import logging
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable, Coroutine
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Annotated, AsyncIterator
+from typing import Annotated
 from urllib.parse import quote, unquote
 
 import aiofiles
@@ -32,6 +32,7 @@ from app.downloader import (
     DownloadTimeoutError,
     FileSizeExceededError,
     MetadataExtractionError,
+    ytdlp_executor,
 )
 
 logging.basicConfig(
@@ -76,34 +77,8 @@ class DownloadRequest(BaseModel):
     )
 
 
-class DownloadForWebRequest(BaseModel):
+class DownloadForWebRequest(DownloadRequest):
     """Request body for POST /download-for-web."""
-
-    url: str = Field(
-        ...,
-        description="Video URL (YouTube, Vimeo, VK, etc.)",
-        examples=["https://www.youtube.com/watch?v=dQw4w9WgXcQ"],
-    )
-    quality: str = Field(
-        default="best",
-        description="Video quality: best, high (1080p), medium (720p), low (480p), audio",
-    )
-    noplaylist: bool = Field(default=True)
-    concurrent_fragment_downloads: int = Field(
-        default=settings.default_concurrent_fragments, ge=1, le=16,
-    )
-    chunk_size: int = Field(
-        default=settings.stream_chunk_size, ge=1024, le=10_485_760,
-    )
-    metadata_timeout: int = Field(
-        default=settings.metadata_timeout_seconds, ge=10, le=300,
-    )
-    download_timeout: int = Field(
-        default=settings.download_timeout_seconds, ge=30, le=7200,
-    )
-    max_file_size: int = Field(
-        default=settings.max_file_size_bytes, ge=1_048_576, le=10_737_418_240,
-    )
 
 
 class ThumbnailRequest(BaseModel):
@@ -125,6 +100,16 @@ class ThumbnailRequest(BaseModel):
 
 _semaphore: asyncio.Semaphore | None = None
 _active_downloads: int = 0
+# The event loop keeps only weak references to tasks; hold fire-and-forget
+# cleanup tasks here so they cannot be garbage-collected before they finish
+# (a lost cleanup task would leak the session dir and a download slot).
+_background_tasks: set[asyncio.Task] = set()
+
+
+def _spawn_background(coro: Coroutine) -> None:
+    task = asyncio.create_task(coro)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
 
 
 @asynccontextmanager
@@ -150,12 +135,16 @@ async def lifespan(_app: FastAPI):
             logger.info("No %s cookies configured", label)
 
     logger.info(
-        "Service started — temp=%s, max_concurrent=%d",
+        "Service started — temp=%s, max_concurrent=%d, yt-dlp threads=%d",
         settings.temp_download_dir,
         settings.max_concurrent_downloads,
+        settings.ytdlp_executor_workers,
     )
     yield
     logger.info("Service shutting down")
+    # Drop queued work without blocking the loop; running yt-dlp threads
+    # cannot be interrupted and are joined at interpreter exit.
+    ytdlp_executor.shutdown(wait=False, cancel_futures=True)
 
 
 app = FastAPI(
@@ -236,7 +225,8 @@ async def _wait_for_output(
     poll: float = 0.25,
 ) -> Path:
     """Poll until yt-dlp produces a streamable output file."""
-    deadline = time.monotonic() + settings.file_wait_timeout_seconds
+    started = time.monotonic()
+    deadline = started + settings.file_wait_timeout_seconds
     last_log = 0.0
     current_poll = poll
 
@@ -263,11 +253,12 @@ async def _wait_for_output(
                 return final
             raise DownloadError("Download finished but no output file found")
 
-        elapsed = settings.file_wait_timeout_seconds - (deadline - time.monotonic())
+        elapsed = time.monotonic() - started
         if elapsed - last_log >= 30:
             logger.info("Waiting for output file… (%.0fs)", elapsed)
             last_log = elapsed
         if time.monotonic() >= deadline:
+            session.kill()
             raise DownloadError(
                 f"Timeout waiting for output file ({settings.file_wait_timeout_seconds}s)"
             )
@@ -281,6 +272,7 @@ async def _stream_and_cleanup(
     task: asyncio.Task,
     download_future: asyncio.Future,
     cleanup: Callable[[], None],
+    stop: Callable[[], None],
     max_size: int | None = None,
     poll: float = 0.25,
 ) -> AsyncIterator[bytes]:
@@ -293,6 +285,7 @@ async def _stream_and_cleanup(
                 if chunk:
                     streamed += len(chunk)
                     if max_size and streamed > max_size:
+                        stop()
                         task.cancel()
                         raise FileSizeExceededError(
                             f"Streamed {streamed / 1_048_576:.1f}MB — exceeds "
@@ -324,14 +317,15 @@ async def _stream_and_cleanup(
         if not task.done():
             try:
                 await asyncio.wait_for(asyncio.shield(task), timeout=900)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 logger.warning("Download didn't finish within 15 min of stream end")
-                asyncio.create_task(
+                stop()
+                _spawn_background(
                     _deferred_cleanup(download_future, cleanup, reason="stream-timeout")
                 )
                 deferred = True
             except asyncio.CancelledError:
-                asyncio.create_task(
+                _spawn_background(
                     _deferred_cleanup(download_future, cleanup, reason="stream-cancelled")
                 )
                 deferred = True
@@ -339,7 +333,7 @@ async def _stream_and_cleanup(
                 pass
         if not deferred:
             if not download_future.done():
-                asyncio.create_task(
+                _spawn_background(
                     _deferred_cleanup(download_future, cleanup, reason="stream-finished")
                 )
             else:
@@ -376,18 +370,18 @@ async def _deferred_cleanup(
 async def _monitor_download(
     future: asyncio.Future,
     timeout: int,
+    stop: Callable[[], None],
 ) -> None:
     """Await download with timeout enforcement."""
-    try:
-        await asyncio.wait_for(future, timeout=timeout)
-    except asyncio.TimeoutError:
-        # Do NOT cleanup here. run_in_executor work may still be writing;
-        # cleanup must happen only after the executor future truly finishes.
+    # asyncio.wait never cancels *future*: a cancelled future would look done
+    # while the job is still running and cleanup would start too early.
+    done, _ = await asyncio.wait({future}, timeout=timeout)
+    if not done:
+        # Kill the job, but do NOT cleanup here: cleanup waits for *future*,
+        # which ends once the killed process is gone.
+        stop()
         raise DownloadTimeoutError(f"Download exceeded {timeout}s timeout")
-    except asyncio.CancelledError:
-        raise
-    except Exception:
-        raise
+    future.result()
 
 
 # ===================================================================
@@ -416,14 +410,14 @@ async def _handle_download(
             _semaphore.acquire(),
             timeout=settings.download_slot_acquire_timeout_seconds,
         )
-    except asyncio.TimeoutError:
+    except TimeoutError as exc:
         raise HTTPException(
             status_code=503,
             detail=(
                 f"Server at capacity ({settings.max_concurrent_downloads} "
                 "concurrent downloads). Try again later."
             ),
-        )
+        ) from exc
 
     _active_downloads += 1
     logger.info(
@@ -443,15 +437,19 @@ async def _handle_download(
 
     cleanup_done = False
     download_future: asyncio.Future | None = None
+    dl_task: asyncio.Task | None = None
 
-    def release_and_cleanup() -> None:
+    def release_and_cleanup(delete_files: bool = True) -> None:
         global _active_downloads
         nonlocal cleanup_done
         if cleanup_done:
             return
         cleanup_done = True
         try:
-            session.cleanup()
+            if delete_files:
+                session.cleanup()
+            elif session.session_dir.exists():
+                logger.info("Keeping session dir %s (CLEANUP_ON_ERROR=false)", session.session_dir)
         finally:
             _semaphore.release()
             _active_downloads = max(0, _active_downloads - 1)
@@ -461,6 +459,27 @@ async def _handle_download(
                 settings.max_concurrent_downloads,
             )
 
+    def cleanup_after_error(reason: str) -> None:
+        # The request already failed, so nobody reads the monitor's outcome
+        # (e.g. the stop after a file-wait timeout); retrieve it to avoid
+        # "Task exception was never retrieved".
+        if dl_task is not None:
+            dl_task.add_done_callback(
+                lambda t: t.cancelled() or t.exception()
+            )
+        # The download slot is always released; CLEANUP_ON_ERROR only decides
+        # whether the session dir is deleted.  Either way wait for a
+        # still-running executor download first: it still occupies the slot.
+        def release() -> None:
+            release_and_cleanup(delete_files=settings.cleanup_on_error)
+
+        if download_future is not None and not download_future.done():
+            _spawn_background(
+                _deferred_cleanup(download_future, release, reason=reason)
+            )
+        else:
+            release()
+
     try:
         # ---- metadata ----
         try:
@@ -468,7 +487,7 @@ async def _handle_download(
         except MetadataExtractionError as exc:
             raise HTTPException(
                 status_code=400, detail=f"Failed to extract video info: {exc}",
-            )
+            ) from exc
 
         size_info = ""
         if meta.estimated_size:
@@ -491,7 +510,7 @@ async def _handle_download(
         dl_future = session.start_download()
         download_future = dl_future
         dl_task = asyncio.create_task(
-            _monitor_download(dl_future, download_timeout),
+            _monitor_download(dl_future, download_timeout, session.kill),
         )
 
         # ---- wait for file to appear ----
@@ -517,6 +536,7 @@ async def _handle_download(
                 dl_task,
                 dl_future,
                 release_and_cleanup,
+                session.kill,
                 max_file_size,
             ),
             media_type=mime,
@@ -529,39 +549,21 @@ async def _handle_download(
         )
 
     except DownloadTimeoutError as exc:
-        if settings.cleanup_on_error and download_future is not None:
-            asyncio.create_task(
-                _deferred_cleanup(download_future, release_and_cleanup, reason="request-timeout")
-            )
-        raise HTTPException(status_code=408, detail=str(exc))
+        # Only raised by the monitor task, so download_future is always set.
+        cleanup_after_error("request-timeout")
+        raise HTTPException(status_code=408, detail=str(exc)) from exc
     except FileSizeExceededError as exc:
         release_and_cleanup()
-        raise HTTPException(status_code=413, detail=str(exc))
+        raise HTTPException(status_code=413, detail=str(exc)) from exc
     except HTTPException:
-        if settings.cleanup_on_error:
-            if download_future is not None and not download_future.done():
-                asyncio.create_task(
-                    _deferred_cleanup(
-                        download_future, release_and_cleanup, reason="http-exception"
-                    )
-                )
-            else:
-                release_and_cleanup()
+        cleanup_after_error("http-exception")
         raise
     except Exception as exc:
         logger.exception("Unexpected error: %s", exc)
-        if settings.cleanup_on_error:
-            if download_future is not None and not download_future.done():
-                asyncio.create_task(
-                    _deferred_cleanup(
-                        download_future, release_and_cleanup, reason="unexpected-error"
-                    )
-                )
-            else:
-                release_and_cleanup()
+        cleanup_after_error("unexpected-error")
         raise HTTPException(
             status_code=500, detail=f"Internal server error: {exc}",
-        )
+        ) from exc
 
 
 # ===================================================================
@@ -577,61 +579,6 @@ async def health_check() -> dict:
         "active_downloads": _active_downloads,
         "max_concurrent_downloads": settings.max_concurrent_downloads,
     }
-
-
-# ===================================================================
-# /debug/cookies
-# ===================================================================
-
-
-@app.get("/debug/cookies")
-async def debug_cookies() -> dict:
-    result: dict = {
-        "cookies_file_configured": (
-            str(settings.cookies_file) if settings.cookies_file else None
-        ),
-        "cookies_file_exists": False,
-        "cookies_file_size": 0,
-        "total_domains": 0,
-        "video_platform_domains": {},
-        "vk_cookies_count": 0,
-        "sample_vk_cookies": [],
-    }
-
-    if not settings.cookies_file:
-        return result
-    result["cookies_file_exists"] = settings.cookies_file.exists()
-    if not settings.cookies_file.exists():
-        return result
-
-    result["cookies_file_size"] = settings.cookies_file.stat().st_size
-
-    try:
-        with open(settings.cookies_file, encoding="utf-8") as f:
-            domains: set[str] = set()
-            vk_cookies: list[dict] = []
-            for line in f:
-                line = line.strip()
-                if line and not line.startswith("#"):
-                    parts = line.split("\t")
-                    if len(parts) >= 7:
-                        domain, cookie_name = parts[0], parts[5]
-                        domains.add(domain)
-                        if "vk" in domain.lower():
-                            vk_cookies.append(
-                                {"domain": domain, "name": cookie_name, "path": parts[2]}
-                            )
-            result["total_domains"] = len(domains)
-            result["vk_cookies_count"] = len(vk_cookies)
-            result["sample_vk_cookies"] = vk_cookies[:20]
-            result["video_platform_domains"] = {
-                p: sorted(d for d in domains if p in d.lower())
-                for p in ("youtube", "vk", "vimeo", "rutube")
-            }
-    except Exception as exc:
-        result["error"] = str(exc)
-
-    return result
 
 
 # ===================================================================
@@ -814,10 +761,10 @@ async def _ffmpeg_thumbnail(
     )
     try:
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-    except asyncio.TimeoutError:
+    except TimeoutError as exc:
         proc.kill()
         await proc.wait()
-        raise RuntimeError(f"ffmpeg thumbnail timed out ({timeout}s)")
+        raise RuntimeError(f"ffmpeg thumbnail timed out ({timeout}s)") from exc
     if proc.returncode or not stdout:
         err = stderr.decode(errors="replace")[:500] if stderr else "unknown"
         raise RuntimeError(
@@ -849,7 +796,7 @@ async def download_thumbnail(
         except MetadataExtractionError as exc:
             raise HTTPException(
                 status_code=400, detail=f"Failed to extract video info: {exc}",
-            )
+            ) from exc
 
         image_bytes: bytes | None = None
         mime, ext, source = "image/jpeg", "jpg", "unknown"

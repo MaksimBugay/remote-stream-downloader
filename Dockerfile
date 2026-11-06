@@ -1,7 +1,7 @@
 # yt-dlp FastAPI Microservice
 # Multi-stage build for optimal image size
 
-FROM python:3.14.3-slim AS builder
+FROM python:3.14.10-slim AS builder
 
 # Set build-time environment
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -22,7 +22,7 @@ RUN pip install --target=/build/deps -r requirements.txt
 
 
 # Production stage
-FROM python:3.14.3-slim
+FROM python:3.14.10-slim
 
 # Labels for container metadata
 LABEL org.opencontainers.image.title="yt-dlp Streaming Service" \

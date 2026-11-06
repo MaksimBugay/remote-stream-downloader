@@ -1,11 +1,18 @@
 """yt-dlp download session with per-request temp-folder isolation."""
 
 import asyncio
+import contextlib
 import logging
+import multiprocessing
+import os
 import re
 import shutil
+import signal
+import sys
+import threading
 import unicodedata
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -14,6 +21,22 @@ import yt_dlp
 from app.config import settings
 
 logger = logging.getLogger(__name__)
+
+# Every yt-dlp job runs in its own child process (see DownloadSession._run_child)
+# so a timeout can really stop it: Python threads cannot be killed.  A thread
+# from this pool waits on each child.  It is separate from asyncio's default
+# executor, whose size depends on the host CPU count (Docker CPU limits do not
+# change it) and which aiofiles needs for every streamed chunk.  Threads are
+# created lazily, up to the limit.
+ytdlp_executor = ThreadPoolExecutor(
+    max_workers=settings.ytdlp_executor_workers,
+    thread_name_prefix="yt-dlp",
+)
+
+# forkserver: never fork the multi-threaded server process itself; the fork
+# server imports yt-dlp once so each job starts fast.
+_mp = multiprocessing.get_context("forkserver")
+_mp.set_forkserver_preload(["yt_dlp"])
 
 # ---------------------------------------------------------------------------
 # VK cookie routing
@@ -54,12 +77,47 @@ class FileSizeExceededError(DownloadError):
     pass
 
 
+class DownloadStoppedError(DownloadError):
+    pass
+
+
 # ---------------------------------------------------------------------------
 # Metadata
 # ---------------------------------------------------------------------------
 
 _SKIP_EXTS = frozenset({".part", ".ytdl", ".tmp"})
 _DISK_STEM = "output"
+
+
+class _DownloadLogger:
+    """yt-dlp logger that keeps the quiet/no_warnings output unchanged.
+
+    yt-dlp's HTTP downloader skips a file larger than ``max_filesize`` without
+    raising: it only prints "File is larger than max-filesize" via
+    ``to_screen`` and the download still returns success.  With a logger set,
+    that message arrives in ``debug()``, which is the only way to notice it.
+    """
+
+    _SIZE_SKIP_MARKER = "larger than max-filesize"
+
+    def __init__(self) -> None:
+        self.size_limit_skipped = False
+
+    def debug(self, msg: str) -> None:
+        # Screen/progress output: hidden by ``quiet`` before, still hidden.
+        if self._SIZE_SKIP_MARKER in msg:
+            self.size_limit_skipped = True
+
+    def info(self, msg: str) -> None:
+        pass
+
+    def warning(self, msg: str) -> None:
+        # Hidden by ``no_warnings`` before, still hidden.
+        pass
+
+    def error(self, msg: str) -> None:
+        # yt-dlp wrote errors to stderr without a logger; keep doing so.
+        sys.stderr.write(f"{msg}\n")
 
 
 @dataclass
@@ -141,6 +199,83 @@ class DownloadSession:
         self._cookies_path: Path | None = None
         self._cookies_mtime: float | None = None
         self._reported_output_path: Path | None = None
+        # Child process running the current yt-dlp job (see _run_child).
+        self._proc_lock = threading.Lock()
+        self._proc: multiprocessing.process.BaseProcess | None = None
+        self._stopped = False
+
+    def __getstate__(self) -> dict:
+        # The session is pickled into the child; process handles stay here.
+        state = self.__dict__.copy()
+        for key in ("_proc_lock", "_proc"):
+            state.pop(key, None)
+        return state
+
+    # ------------------------------------------------------- child process
+
+    def kill(self) -> None:
+        """Stop the running yt-dlp job and its subprocesses (e.g. ffmpeg).
+
+        Safe to call from any thread, repeatedly, or before a job started
+        (the next job then refuses to start).  Wait for the job's future to
+        finish before deleting the session dir.
+        """
+        with self._proc_lock:
+            self._stopped = True
+            proc = self._proc
+        if proc is None or proc.pid is None:
+            return
+        try:
+            # The child leads its own process group (os.setsid in _child_main).
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            # Not yet a group leader, or already gone.
+            with contextlib.suppress(Exception):
+                proc.kill()
+        logger.info("Stopped yt-dlp job (pid %d)", proc.pid)
+
+    def _run_child(self, kind: str, opts: dict):
+        """Run one yt-dlp job in a child process; blocks until it ends."""
+        recv, send = _mp.Pipe(duplex=False)
+        proc = _mp.Process(
+            target=_child_main, args=(send, self, kind, opts), daemon=True,
+        )
+        with self._proc_lock:
+            if self._stopped:
+                recv.close()
+                send.close()
+                raise DownloadStoppedError("yt-dlp job stopped")
+            proc.start()
+            self._proc = proc
+        send.close()
+        try:
+            while True:
+                try:
+                    msg = recv.recv()
+                except EOFError:
+                    break
+                if msg[0] == "path":
+                    self._reported_output_path = Path(msg[1])
+                elif msg[0] == "ok":
+                    return msg[1]
+                elif msg[0] == "error":
+                    raise msg[1]
+            if self._stopped:
+                raise DownloadStoppedError("yt-dlp job stopped")
+            raise DownloadError(f"yt-dlp process exited (code {proc.exitcode})")
+        finally:
+            recv.close()
+            proc.join()
+            with self._proc_lock:
+                self._proc = None
+            proc.close()
+
+    async def _stop_and_wait(self, fut: asyncio.Future) -> None:
+        """Kill the job behind *fut* and wait until it has really ended."""
+        self.kill()
+        await asyncio.wait({fut})
+        if not fut.cancelled():
+            fut.exception()  # mark retrieved; the job was stopped on purpose
 
     # -------------------------------------------------------------- cookies
 
@@ -263,6 +398,14 @@ class DownloadSession:
             opts["merge_output_format"] = self.merge_output_format
         return opts
 
+    def _session_path(self, candidate: str) -> Path | None:
+        """Resolve a path reported by yt-dlp relative to the session dir."""
+        try:
+            path = Path(candidate)
+        except Exception:
+            return None
+        return path if path.is_absolute() else self.session_dir / path
+
     def _progress_hook(self, data: dict) -> None:
         """Capture output path from yt-dlp progress events.
 
@@ -277,14 +420,9 @@ class DownloadSession:
         candidate = info.get("filepath") or data.get("filename")
         if not candidate:
             return
-        try:
-            path = Path(candidate)
-            if not path.is_absolute():
-                path = self.session_dir / path
-            if path.stem == _DISK_STEM:
-                self._reported_output_path = path
-        except Exception:
-            return
+        path = self._session_path(candidate)
+        if path and path.stem == _DISK_STEM:
+            self._reported_output_path = path
 
     def _postprocessor_hook(self, data: dict) -> None:
         """Capture final output path after postprocessors (e.g. ffmpeg merge)."""
@@ -294,26 +432,30 @@ class DownloadSession:
         filepath = info.get("filepath")
         if not filepath:
             return
-        try:
-            path = Path(filepath)
-            if not path.is_absolute():
-                path = self.session_dir / path
+        path = self._session_path(filepath)
+        if path:
             self._reported_output_path = path
-        except Exception:
-            return
 
     # ------------------------------------------------------------- metadata
 
     async def extract_metadata(self, timeout: int | None = None) -> VideoMetadata:
         opts = self._extract_opts()
+        loop = asyncio.get_running_loop()
+        fut = loop.run_in_executor(ytdlp_executor, self._run_child, "extract", opts)
         try:
-            loop = asyncio.get_running_loop()
-            fut = loop.run_in_executor(None, self._do_extract, opts)
-            info = await (asyncio.wait_for(fut, timeout=timeout) if timeout else fut)
-        except asyncio.TimeoutError:
-            raise MetadataExtractionError(
-                f"Metadata extraction timed out ({timeout}s)"
-            )
+            # asyncio.wait never cancels fut: on timeout the job is killed and
+            # awaited, not abandoned.
+            done, _ = await asyncio.wait({fut}, timeout=timeout)
+            if not done:
+                await self._stop_and_wait(fut)
+                raise MetadataExtractionError(
+                    f"Metadata extraction timed out ({timeout}s)"
+                )
+            info = fut.result()
+        except asyncio.CancelledError:
+            # Request cancelled (e.g. client gone): don't leave the job running.
+            await self._stop_and_wait(fut)
+            raise
         except MetadataExtractionError:
             raise
         except Exception as exc:
@@ -379,17 +521,22 @@ class DownloadSession:
     # -------------------------------------------------------------- download
 
     def start_download(self) -> asyncio.Future:
-        """Kick off the download in a background executor thread."""
+        """Kick off the download in a child process (see ``kill()``)."""
         opts = self._download_opts()
         return asyncio.get_running_loop().run_in_executor(
-            None, self._do_download, opts
+            ytdlp_executor, self._run_child, "download", opts
         )
 
     def _do_download(self, opts: dict) -> None:
-        with yt_dlp.YoutubeDL(opts) as ydl:
+        dl_logger = _DownloadLogger()
+        with yt_dlp.YoutubeDL(opts | {"logger": dl_logger}) as ydl:
             rc = ydl.download([self.source_url])
             if rc:
                 raise DownloadError(f"yt-dlp error code {rc}")
+        if dl_logger.size_limit_skipped:
+            raise FileSizeExceededError(
+                f"File exceeds {self.max_filesize / 1_048_576:.1f}MB limit"
+            )
 
     # -------------------------------------------------------- output helpers
 
@@ -447,3 +594,46 @@ class DownloadSession:
         if self.session_dir.exists():
             shutil.rmtree(self.session_dir, ignore_errors=True)
             logger.debug("Removed session dir %s", self.session_dir)
+
+
+# ---------------------------------------------------------------------------
+# Child process entry point
+# ---------------------------------------------------------------------------
+
+
+def _child_main(conn, session: DownloadSession, kind: str, opts: dict) -> None:
+    """Run one yt-dlp job and report back over *conn*.
+
+    Messages: ``("path", str)`` whenever a hook reports a new output path,
+    then ``("ok", result)`` or ``("error", DownloadError)``.
+    """
+    # Own process group, so kill() also stops ffmpeg & co. started by yt-dlp.
+    os.setsid()
+    try:
+        if kind == "extract":
+            result = yt_dlp.YoutubeDL.sanitize_info(session._do_extract(opts))
+        else:
+            sent: Path | None = None
+
+            def report_path(_data: dict) -> None:
+                nonlocal sent
+                path = session._reported_output_path
+                if path is not None and path != sent:
+                    sent = path
+                    conn.send(("path", str(path)))
+
+            # Hooks must update the child's session copy, then forward it.
+            opts = opts | {
+                "progress_hooks": [session._progress_hook, report_path],
+                "postprocessor_hooks": [session._postprocessor_hook, report_path],
+            }
+            session._do_download(opts)
+            result = None
+        conn.send(("ok", result))
+    except DownloadError as exc:
+        conn.send(("error", exc))
+    except BaseException as exc:
+        # yt-dlp's own exceptions may hold tracebacks that cannot be pickled.
+        conn.send(("error", DownloadError(str(exc))))
+    finally:
+        conn.close()

@@ -35,6 +35,9 @@ class Settings(BaseSettings):
     # Concurrency
     max_concurrent_downloads: int = 10
     download_slot_acquire_timeout_seconds: float = 1.0
+    # Threads reserved for yt-dlp (metadata + downloads), separate from the
+    # default pool that aiofiles uses for streaming reads.
+    ytdlp_executor_workers: int = 100
 
     # File size
     max_file_size_bytes: int = 1024 * 1024 * 1024

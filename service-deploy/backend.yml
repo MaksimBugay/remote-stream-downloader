@@ -1,0 +1,91 @@
+
+version: '3.8'
+
+services:
+  remote-stream-downloader:
+    restart: unless-stopped
+    image: yt-dlp-streamer:latest
+    environment:
+      # Server settings
+      - HOST=0.0.0.0
+      - PORT=8000
+
+      # Download settings
+      - METADATA_TIMEOUT_SECONDS=${METADATA_TIMEOUT_SECONDS:-300}
+      - DOWNLOAD_TIMEOUT_SECONDS=${DOWNLOAD_TIMEOUT_SECONDS:-900}
+      - DEFAULT_QUALITY=${DEFAULT_QUALITY:-best}
+      - DEFAULT_CONCURRENT_FRAGMENTS=${DEFAULT_CONCURRENT_FRAGMENTS:-8}
+
+      # Streaming settings
+      - STREAM_CHUNK_SIZE=${STREAM_CHUNK_SIZE:-1048576}
+
+      # Storage settings
+      - TEMP_DOWNLOAD_DIR=/tmp/yt-dlp-downloads
+      - CLEANUP_ON_ERROR=true
+
+      # Concurrency settings
+      - MAX_CONCURRENT_DOWNLOADS=${MAX_CONCURRENT_DOWNLOADS:-10}
+
+      # File size limits (1GB default)
+      - MAX_FILE_SIZE_BYTES=${MAX_FILE_SIZE_BYTES:-10737418240}
+      # General cookies (YouTube, etc.)
+      - COOKIES_FILE=/app/cookies-all.txt
+      # VK-specific cookies (vk.com, vkvideo.ru)
+      - COOKIES_FILE_VK=/app/cookies-vk.txt
+      #- PROXY=http://vpn:8888
+    ports:
+      - target: 8000
+        published: 8000
+        protocol: tcp
+    volumes:
+      - ./cookies-all.txt:/app/cookies-all.txt
+      - ./cookies-vk.txt:/app/cookies-vk.txt
+      - ./downloads-temp:/tmp/yt-dlp-downloads:rw
+    networks:
+      secure-file-share-net:
+        aliases:
+          - remote-stream-downloader-local
+    healthcheck:
+      test: [ "CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')" ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+    # Security settings
+    security_opt:
+      - no-new-privileges:true
+    read_only: false
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    labels:
+      filebeats_log: "false"
+    deploy:
+      labels:
+        - traefik.enable=false
+      replicas: 1
+      resources:
+        limits:
+          cpus: '2'
+          memory: 4096M
+        reservations:
+          cpus: '0.5'
+          memory: 512M
+      restart_policy:
+        condition: any
+        delay: 5s
+        max_attempts: 9999999
+        window: 90s
+
+networks:
+  secure-file-share-net:
+    external: true
+
+# Named volumes
+volumes:
+  yt-dlp-temp:
+    driver: local
