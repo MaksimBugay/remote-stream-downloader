@@ -17,10 +17,17 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import yt_dlp
+from yt_dlp.globals import plugin_dirs
 
 from app.config import settings
 
 logger = logging.getLogger(__name__)
+
+# Our own extractors, in yt-dlp's plugin layout (ytdlp_plugins/<pkg>/
+# yt_dlp_plugins/extractor/*.py); plugins are tried before built-in extractors.
+# Set before any YoutubeDL is created: every job process imports this module
+# first, and yt-dlp loads plugins once per process on its first YoutubeDL.
+plugin_dirs.value = [str(Path(__file__).parent / "ytdlp_plugins")]
 
 # Every yt-dlp job runs in its own child process (see DownloadSession._run_child)
 # so a timeout can really stop it: Python threads cannot be killed.  A thread
